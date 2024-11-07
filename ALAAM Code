@@ -1,0 +1,593 @@
+import sys
+import pandas as pd
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QFileDialog, QLabel, QComboBox, QMessageBox, QMenuBar, QAction,
+    QFrame, QInputDialog, QStyleFactory, QCheckBox, QSplitter, QSizePolicy
+)
+from PyQt5.QtGui import QIcon, QPalette, QColor
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import numpy as np
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s:%(message)s',
+    handlers=[
+        logging.FileHandler("alaamui.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Thread class for loading data
+class DataLoaderThread(QThread):
+    data_loaded = pyqtSignal(pd.DataFrame)
+    error = pyqtSignal(str)
+
+    def __init__(self, filePath):
+        super().__init__()
+        self.filePath = filePath
+
+    def run(self):
+        try:
+            df = pd.read_csv(self.filePath)
+            logging.info(f"Data loaded successfully from {self.filePath}")
+            self.data_loaded.emit(df)
+        except Exception as e:
+            logging.error(f"Failed to load data: {e}")
+            self.error.emit(str(e))
+
+class ALAAMUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.graph = None  # Store the graph object
+        self.graphCanvas = None
+        self.degreeDistCanvas = None
+        self.current_layout = "Spring Layout"
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle('ALAAM Network Analysis Tool')
+        self.setWindowIcon(QIcon('app_icon.png') if os.path.exists('app_icon.png') else QIcon())
+        self.setGeometry(100, 100, 1600, 1000)  # Increased window size
+        self.setStyleSheet("background-color: #282C34;")  # Default dark theme
+
+        # Main Layout
+        main_layout = QVBoxLayout()
+        self.setLayout(main_layout)
+
+        # Setup Menu
+        self.setup_menu(main_layout)
+
+        # Setup Title
+        self.setup_title(main_layout)
+
+        # Setup Separator
+        self.setup_separator(main_layout)
+
+        # Setup Controls
+        self.setup_controls(main_layout)
+
+        # Setup Splitter for Visualization and Degree Distribution
+        self.setup_visualization_splitter(main_layout)
+
+        # Setup Report Button and Theme Toggle
+        self.setup_bottom_controls(main_layout)
+
+        self.show()
+
+    def setup_menu(self, layout):
+        menubar = QMenuBar(self)
+        fileMenu = menubar.addMenu('File')
+
+        # Open Action
+        open_icon = QIcon('open.png') if os.path.exists('open.png') else QIcon()
+        openAction = QAction(open_icon, 'Open', self)
+        openAction.setShortcut('Ctrl+O')
+        openAction.setStatusTip('Open network data file')
+        openAction.triggered.connect(self.load_data)
+        fileMenu.addAction(openAction)
+        openAction.setToolTip("Open a CSV file containing network data")
+
+        # Exit Action
+        exit_icon = QIcon('exit.png') if os.path.exists('exit.png') else QIcon()
+        exitAction = QAction(exit_icon, 'Exit', self)
+        exitAction.setShortcut('Ctrl+Q')
+        exitAction.setStatusTip('Exit application')
+        exitAction.triggered.connect(self.close)
+        fileMenu.addAction(exitAction)
+        exitAction.setToolTip("Exit the application")
+
+        # Add MenuBar to the layout
+        layout.setMenuBar(menubar)
+
+    def setup_title(self, layout):
+        self.title = QLabel("ALAAM Network Analysis Tool", self)
+        self.title.setStyleSheet("font-size: 28px; font-weight: bold; color: #61AFEF;")
+        self.title.setAlignment(Qt.AlignCenter)
+        self.title.setToolTip("Network Analysis Tool")
+        layout.addWidget(self.title)
+
+    def setup_separator(self, layout):
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(separator)
+
+    def setup_controls(self, layout):
+        controls_layout = QHBoxLayout()
+
+        # Load Data Button
+        self.loadButton = QPushButton('Load Network Data', self)
+        self.loadButton.setIcon(QIcon('open.png') if os.path.exists('open.png') else QIcon())
+        self.loadButton.setStyleSheet("background-color: #61AFEF; color: white; font-weight: bold;")
+        self.loadButton.clicked.connect(self.load_data)
+        self.loadButton.setToolTip("Load network data from a CSV file")
+        controls_layout.addWidget(self.loadButton)
+
+        # Layout Selector Combo Box
+        self.layoutSelector = QComboBox(self)
+        self.layoutSelector.addItems([
+            "Spring Layout", "Circular Layout", "Random Layout",
+            "Kamada-Kawai Layout", "Spectral Layout"
+        ])
+        self.layoutSelector.setStyleSheet("background-color: #98C379; color: black;")
+        self.layoutSelector.currentTextChanged.connect(self.update_graph_layout)
+        self.layoutSelector.setToolTip("Select layout for network visualization")
+        controls_layout.addWidget(self.layoutSelector)
+
+        # Export Graph Button
+        self.exportGraphButton = QPushButton('Export Graph', self)
+        self.exportGraphButton.setStyleSheet("background-color: #C678DD; color: white; font-weight: bold;")
+        self.exportGraphButton.clicked.connect(self.export_graph)
+        self.exportGraphButton.setToolTip("Export the network graph as an image")
+        self.exportGraphButton.setEnabled(False)
+        controls_layout.addWidget(self.exportGraphButton)
+
+        # Add the control layout to the main layout
+        layout.addLayout(controls_layout)
+
+    def setup_visualization_splitter(self, layout):
+        # Create a splitter to separate the graph and the degree distribution
+        splitter = QSplitter(Qt.Vertical)
+
+        # Upper part: Network Visualization
+        visualization_layout = QVBoxLayout()
+        visualization_container = QWidget()
+        visualization_container.setLayout(visualization_layout)
+
+        # Network Visualization Label
+        self.graphLabel = QLabel("Network Visualization", self)
+        self.graphLabel.setStyleSheet("font-size: 20px; font-weight: bold; color: #E06C75;")
+        self.graphLabel.setAlignment(Qt.AlignCenter)
+        visualization_layout.addWidget(self.graphLabel)
+
+        # Placeholder QWidget for the graph canvas
+        self.graphWidget = QWidget(self)
+        self.graphLayout = QVBoxLayout()
+        self.graphWidget.setLayout(self.graphLayout)
+        visualization_layout.addWidget(self.graphWidget)
+
+        # Lower part: Degree Distribution
+        degree_layout = QVBoxLayout()
+        degree_container = QWidget()
+        degree_container.setLayout(degree_layout)
+
+        # Degree Distribution Label
+        self.degreeDistLabel = QLabel("Degree Distribution", self)
+        self.degreeDistLabel.setStyleSheet("font-size: 18px; font-weight: bold; color: #E5C07B;")
+        self.degreeDistLabel.setAlignment(Qt.AlignCenter)
+        degree_layout.addWidget(self.degreeDistLabel)
+
+        # Placeholder QWidget for the degree distribution canvas
+        self.degreeDistWidget = QWidget(self)
+        self.degreeDistLayout = QVBoxLayout()
+        self.degreeDistWidget.setLayout(self.degreeDistLayout)
+        degree_layout.addWidget(self.degreeDistWidget)
+
+        # Add both containers to the splitter
+        splitter.addWidget(visualization_container)
+        splitter.addWidget(degree_container)
+
+        # Set initial sizes (adjust as needed)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+
+        # Add splitter to the main layout
+        layout.addWidget(splitter)
+
+    def setup_bottom_controls(self, layout):
+        bottom_controls_layout = QHBoxLayout()
+
+        # Statistics Label
+        self.statsLabel = QLabel("", self)
+        self.statsLabel.setStyleSheet("font-size: 16px; color: #ABB2BF;")
+        bottom_controls_layout.addWidget(self.statsLabel)
+
+        # Spacer
+        bottom_controls_layout.addStretch()
+
+        # Add Report Button
+        self.reportButton = QPushButton("Generate Report", self)
+        self.reportButton.setStyleSheet("background-color: #E5C07B; color: black; font-weight: bold;")
+        self.reportButton.clicked.connect(self.generate_report)
+        self.reportButton.setEnabled(False)
+        self.reportButton.setToolTip("Generate and save a report of the network statistics")
+        bottom_controls_layout.addWidget(self.reportButton)
+
+        # Theme Toggle Checkbox
+        self.themeToggle = QCheckBox("Light Theme", self)
+        self.themeToggle.setStyleSheet("color: white;")
+        self.themeToggle.stateChanged.connect(self.toggle_theme)
+        self.themeToggle.setToolTip("Toggle between Dark and Light themes")
+        bottom_controls_layout.addWidget(self.themeToggle)
+
+        # Add the bottom controls to the main layout
+        layout.addLayout(bottom_controls_layout)
+
+    def toggle_theme(self, state):
+        if state == Qt.Checked:
+            # Switch to light theme
+            self.set_light_theme()
+        else:
+            # Switch to dark theme
+            self.set_dark_theme()
+
+    def set_light_theme(self):
+        logging.info("Switching to light theme")
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor("#FFFFFF"))
+        palette.setColor(QPalette.WindowText, Qt.black)
+        palette.setColor(QPalette.Base, QColor("#FFFFFF"))
+        palette.setColor(QPalette.AlternateBase, QColor("#F0F0F0"))
+        palette.setColor(QPalette.ToolTipBase, Qt.black)
+        palette.setColor(QPalette.ToolTipText, Qt.black)
+        palette.setColor(QPalette.Text, Qt.black)
+        palette.setColor(QPalette.Button, QColor("#E0E0E0"))
+        palette.setColor(QPalette.ButtonText, Qt.black)
+        palette.setColor(QPalette.BrightText, Qt.red)
+        palette.setColor(QPalette.Link, QColor("#0000FF"))
+        palette.setColor(QPalette.Highlight, QColor("#3399FF"))
+        palette.setColor(QPalette.HighlightedText, Qt.white)
+        QApplication.instance().setPalette(palette)
+        self.setStyleSheet("background-color: #FFFFFF;")
+        self.title.setStyleSheet("font-size: 28px; font-weight: bold; color: #61AFEF;")
+        self.graphLabel.setStyleSheet("font-size: 20px; font-weight: bold; color: #E06C75;")
+        self.degreeDistLabel.setStyleSheet("font-size: 18px; font-weight: bold; color: #E5C07B;")
+        self.statsLabel.setStyleSheet("font-size: 16px; color: #000000;")
+        # Update existing plots if they exist
+        self.update_plot_colors()
+
+    def set_dark_theme(self):
+        logging.info("Switching to dark theme")
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor("#282C34"))
+        palette.setColor(QPalette.WindowText, Qt.white)
+        palette.setColor(QPalette.Base, QColor("#3C3F41"))
+        palette.setColor(QPalette.AlternateBase, QColor("#424242"))
+        palette.setColor(QPalette.ToolTipBase, Qt.white)
+        palette.setColor(QPalette.ToolTipText, Qt.white)
+        palette.setColor(QPalette.Text, Qt.white)
+        palette.setColor(QPalette.Button, QColor("#61AFEF"))
+        palette.setColor(QPalette.ButtonText, Qt.black)
+        palette.setColor(QPalette.BrightText, Qt.red)
+        palette.setColor(QPalette.Link, QColor("#61AFEF"))
+        palette.setColor(QPalette.Highlight, QColor("#98C379"))
+        palette.setColor(QPalette.HighlightedText, Qt.black)
+        QApplication.instance().setPalette(palette)
+        self.setStyleSheet("background-color: #282C34;")
+        self.title.setStyleSheet("font-size: 28px; font-weight: bold; color: #61AFEF;")
+        self.graphLabel.setStyleSheet("font-size: 20px; font-weight: bold; color: #E06C75;")
+        self.degreeDistLabel.setStyleSheet("font-size: 18px; font-weight: bold; color: #E5C07B;")
+        self.statsLabel.setStyleSheet("font-size: 16px; color: #ABB2BF;")
+        # Update existing plots if they exist
+        self.update_plot_colors()
+
+    def update_plot_colors(self):
+        # Update the existing plots' colors based on the current theme
+        if self.graphCanvas and isinstance(self.graphCanvas, FigureCanvas):
+            fig = self.graphCanvas.figure
+            fig.patch.set_facecolor('#282C34' if not self.themeToggle.isChecked() else '#FFFFFF')
+            ax = fig.axes[0]
+            ax.set_facecolor('#282C34' if not self.themeToggle.isChecked() else '#FFFFFF')
+            for spine in ax.spines.values():
+                spine.set_color('#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+            for text in ax.texts:
+                text.set_color('#E06C75' if not self.themeToggle.isChecked() else '#000000')
+            self.graphCanvas.draw()
+
+        if self.degreeDistCanvas and isinstance(self.degreeDistCanvas, FigureCanvas):
+            fig = self.degreeDistCanvas.figure
+            fig.patch.set_facecolor('#282C34' if not self.themeToggle.isChecked() else '#FFFFFF')
+            ax = fig.axes[0]
+            ax.set_facecolor('#282C34' if not self.themeToggle.isChecked() else '#FFFFFF')
+            ax.set_xlabel('Degree', color='#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+            ax.set_ylabel('Frequency', color='#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+            ax.set_title('Degree Distribution', color='#E5C07B' if not self.themeToggle.isChecked() else '#000000')
+            for spine in ax.spines.values():
+                spine.set_color('#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+            ax.xaxis.label.set_color('#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+            ax.yaxis.label.set_color('#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+            ax.tick_params(axis='x', colors='#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+            ax.tick_params(axis='y', colors='#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+            self.degreeDistCanvas.draw()
+
+    def load_data(self):
+        options = QFileDialog.Options()
+        filePath, _ = QFileDialog.getOpenFileName(
+            self, "Open Network Data File", "",
+            "CSV Files (*.csv);;Text Files(*.txt)", options=options
+        )
+
+        if filePath:
+            logging.info(f"Selected file for loading: {filePath}")
+            self.thread = DataLoaderThread(filePath)
+            self.thread.data_loaded.connect(self.process_data)
+            self.thread.error.connect(self.handle_error)
+            self.thread.start()
+
+    def process_data(self, df):
+        try:
+            logging.info("Processing loaded data")
+            # Print the DataFrame structure for debugging
+            logging.debug("DataFrame Loaded:")
+            logging.debug(df.head())
+
+            # Check if the DataFrame has at least two columns
+            if df.shape[1] < 2:
+                QMessageBox.warning(self, "Error", "CSV file must have at least two columns for edges.")
+                logging.warning("CSV file has less than two columns.")
+                return
+
+            # If the DataFrame has exactly two columns, use them directly
+            if df.shape[1] == 2:
+                edge_source = df.columns[0]
+                edge_target = df.columns[1]
+            else:
+                # If more than two columns, let the user select which two to use for the edges
+                column_names = df.columns.tolist()
+                selected_source, ok1 = QInputDialog.getItem(
+                    self, "Select Source Column",
+                    "Select a source column for edges:",
+                    column_names, 0, False
+                )
+                if not ok1:
+                    logging.info("User canceled source column selection")
+                    return  # User canceled the selection
+
+                column_names.remove(selected_source)  # Remove selected source from options
+                selected_target, ok2 = QInputDialog.getItem(
+                    self, "Select Target Column",
+                    "Select a target column for edges:",
+                    column_names, 0, False
+                )
+                if not ok2:
+                    logging.info("User canceled target column selection")
+                    return  # User canceled the selection
+
+                edge_source = selected_source
+                edge_target = selected_target
+
+            # Create the graph from the selected edges
+            G = nx.from_pandas_edgelist(df, source=edge_source, target=edge_target)
+            self.graph = G  # Store the graph object
+
+            # Visualization and updates
+            self.draw_graph(G)
+            self.reportButton.setEnabled(True)  # Enable report generation
+            self.exportGraphButton.setEnabled(True)  # Enable graph export
+            self.show_statistics(G)  # Show basic statistics
+            self.plot_degree_distribution(G)  # Plot degree distribution
+
+        except Exception as e:
+            logging.error(f"Error processing data: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to process data: {e}")
+
+    def handle_error(self, error_message):
+        logging.error(f"Error loading data: {error_message}")
+        QMessageBox.critical(self, "Error", f"Failed to load file: {error_message}")
+
+    def draw_graph(self, G):
+        if self.graphCanvas:
+            self.graphCanvas.figure.clear()
+            self.graphCanvas.deleteLater()
+            self.graphCanvas = None
+
+        # Determine layout style and adjust spacing
+        layout_option = self.layoutSelector.currentText()
+        if layout_option == "Spring Layout":
+            pos = nx.spring_layout(G, k=0.5, iterations=50)
+        elif layout_option == "Circular Layout":
+            pos = nx.circular_layout(G)
+        elif layout_option == "Random Layout":
+            pos = nx.random_layout(G)
+        elif layout_option == "Kamada-Kawai Layout":
+            pos = nx.kamada_kawai_layout(G)
+        elif layout_option == "Spectral Layout":
+            pos = nx.spectral_layout(G)
+        else:
+            pos = nx.spring_layout(G)  # Default
+
+        # Draw graph with Matplotlib
+        fig, ax = plt.subplots(figsize=(15, 12))  # Increased figure size
+        fig.patch.set_facecolor('#282C34' if not self.themeToggle.isChecked() else '#FFFFFF')
+        ax.set_facecolor('#282C34' if not self.themeToggle.isChecked() else '#FFFFFF')
+
+        # Adjust node size, font size, and edge thickness
+        nx.draw(
+            G, pos, with_labels=True, node_size=1200,  # Increased node size
+            node_color='#61AFEF', font_size=12, font_weight='bold',  # Increased font size
+            edge_color='#ABB2BF', width=2.0, ax=ax  # Increased edge width
+        )
+
+        ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        # Add the graph to the canvas
+        self.graphCanvas = FigureCanvas(fig)
+        self.graphCanvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.graphLayout.addWidget(self.graphCanvas)
+
+        # Update the graphLabel text with node/edge counts
+        self.graphLabel.setText(f"Network Visualization - Nodes: {G.number_of_nodes()}, Edges: {G.number_of_edges()}")
+
+    def update_graph_layout(self, layout_name):
+        if self.graph:
+            logging.info(f"Updating graph layout to {layout_name}")
+            self.current_layout = layout_name
+            self.draw_graph(self.graph)
+
+    def show_statistics(self, G):
+        try:
+            num_nodes = G.number_of_nodes()
+            num_edges = G.number_of_edges()
+            degrees = dict(G.degree())
+            avg_degree = sum(degrees.values()) / float(num_nodes) if num_nodes > 0 else 0
+            clustering_coeff = nx.average_clustering(G)
+            if nx.is_connected(G):
+                shortest_path = nx.average_shortest_path_length(G)
+                connectivity = "Connected"
+            else:
+                components = nx.connected_components(G)
+                num_components = nx.number_connected_components(G)
+                largest_component = max(components, key=len)
+                subgraph = G.subgraph(largest_component)
+                shortest_path = nx.average_shortest_path_length(subgraph)
+                connectivity = f"Disconnected (Number of Components: {num_components})"
+
+            stats_text = (
+                f"Network Statistics:\n"
+                f"- Nodes: {num_nodes}\n"
+                f"- Edges: {num_edges}\n"
+                f"- Average Degree: {avg_degree:.2f}\n"
+                f"- Clustering Coefficient: {clustering_coeff:.4f}\n"
+                f"- Average Shortest Path Length: {shortest_path} ({connectivity})\n"
+            )
+
+            self.statsLabel.setText(stats_text)
+            logging.info("Network statistics displayed")
+        except Exception as e:
+            logging.error(f"Error calculating statistics: {e}")
+            self.statsLabel.setText("Error calculating statistics.")
+
+    def plot_degree_distribution(self, G):
+        if self.degreeDistCanvas:
+            self.degreeDistCanvas.figure.clear()
+            self.degreeDistCanvas.deleteLater()
+            self.degreeDistCanvas = None
+
+        degrees = [d for _, d in G.degree()]
+        degree_counts = np.bincount(degrees)
+        degree_range = range(len(degree_counts))
+
+        fig, ax = plt.subplots(figsize=(15, 8))  # Increased figure size for better visibility
+        fig.patch.set_facecolor('#282C34' if not self.themeToggle.isChecked() else '#FFFFFF')
+        ax.set_facecolor('#282C34' if not self.themeToggle.isChecked() else '#FFFFFF')
+
+        ax.bar(degree_range, degree_counts, width=0.80, color='#98C379')
+        ax.set_xlabel('Degree', color='#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+        ax.set_ylabel('Frequency', color='#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+        ax.set_title('Degree Distribution', color='#E5C07B' if not self.themeToggle.isChecked() else '#000000')
+        ax.spines['bottom'].set_color('#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+        ax.spines['left'].set_color('#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+        ax.xaxis.label.set_color('#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+        ax.yaxis.label.set_color('#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+        ax.tick_params(axis='x', colors='#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+        ax.tick_params(axis='y', colors='#ABB2BF' if not self.themeToggle.isChecked() else '#000000')
+
+        # Add the degree distribution to the splitter
+        self.degreeDistCanvas = FigureCanvas(fig)
+        self.degreeDistCanvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.degreeDistLayout.addWidget(self.degreeDistCanvas)
+        logging.info("Degree distribution plotted")
+
+    def generate_report(self):
+        if self.graph:
+            try:
+                G = self.graph
+                num_nodes = G.number_of_nodes()
+                num_edges = G.number_of_edges()
+                degrees = dict(G.degree())
+                avg_degree = sum(degrees.values()) / float(num_nodes) if num_nodes > 0 else 0
+                clustering_coeff = nx.average_clustering(G)
+                if nx.is_connected(G):
+                    shortest_path = nx.average_shortest_path_length(G)
+                    connectivity = "Connected"
+                else:
+                    components = nx.connected_components(G)
+                    num_components = nx.number_connected_components(G)
+                    largest_component = max(components, key=len)
+                    subgraph = G.subgraph(largest_component)
+                    shortest_path = nx.average_shortest_path_length(subgraph)
+                    connectivity = f"Disconnected (Number of Components: {num_components})"
+
+                report_content = (
+                    f"Network Analysis Report\n"
+                    f"------------------------\n"
+                    f"Number of Nodes: {num_nodes}\n"
+                    f"Number of Edges: {num_edges}\n"
+                    f"Average Degree: {avg_degree:.2f}\n"
+                    f"Clustering Coefficient: {clustering_coeff:.4f}\n"
+                    f"Average Shortest Path Length: {shortest_path} ({connectivity})\n\n"
+                )
+
+                # Optionally, add degree distribution data
+                degree_freq = pd.DataFrame({
+                    'Degree': list(degrees.values())
+                })
+                degree_freq = degree_freq['Degree'].value_counts().sort_index()
+                report_content += "Degree Distribution:\n"
+                for degree, count in degree_freq.items():
+                    report_content += f"Degree {degree}: {count}\n"
+
+                # Open a save file dialog
+                options = QFileDialog.Options()
+                file_path, _ = QFileDialog.getSaveFileName(
+                    self, "Save Report", "", "Text Files (*.txt);;All Files (*)", options=options
+                )
+
+                if file_path:
+                    with open(file_path, 'w') as file:
+                        file.write(report_content)
+                    QMessageBox.information(self, "Success", "Report saved successfully!")
+                    logging.info(f"Report saved to {file_path}")
+                else:
+                    QMessageBox.warning(self, "Warning", "No file path selected. Report not saved.")
+                    logging.warning("User canceled report saving.")
+
+            except Exception as e:
+                logging.error(f"Error generating report: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to generate report: {e}")
+
+    def export_graph(self):
+        if self.graphCanvas:
+            options = QFileDialog.Options()
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Export Graph", "", "PNG Files (*.png);;JPEG Files (*.jpg);;All Files (*)", options=options
+            )
+            if file_path:
+                try:
+                    self.graphCanvas.figure.savefig(file_path)
+                    QMessageBox.information(self, "Success", f"Graph exported successfully to {file_path}")
+                    logging.info(f"Graph exported to {file_path}")
+                except Exception as e:
+                    logging.error(f"Error exporting graph: {e}")
+                    QMessageBox.critical(self, "Error", f"Failed to export graph: {e}")
+            else:
+                QMessageBox.warning(self, "Warning", "No file path selected. Graph not exported.")
+                logging.warning("User canceled graph export.")
+
+    # Optional: Additional features like node/edge attribute visualization and filtering can be implemented here
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    # Apply Fusion style for better aesthetics
+    app.setStyle(QStyleFactory.create('Fusion'))
+    ex = ALAAMUI()
+    sys.exit(app.exec_())
