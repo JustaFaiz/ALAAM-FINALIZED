@@ -1,0 +1,282 @@
+"""
+sheet_tree_visual.py
+---------------------
+Interactive, zoomable HTML TREE of sheet-to-sheet data flow across an
+Excel workbook - the visual version of the auto-derived tree section
+in trace_precedents.py. No hardcoded expectations; it's built purely
+from the actual formulas in the workbook.
+
+Usage:
+    python sheet_tree_visual.py workbook.xlsx
+    python sheet_tree_visual.py workbook.xlsx 5     (only show links with 5+ cells)
+
+Output: sheet_tree.html - open it in any browser.
+Node colors:
+    green  = root sheet (nothing feeds into it - likely a true input)
+    orange = leaf sheet (feeds nothing else - likely a final output)
+    teal   = a sheet in the middle of the flow
+Edge labels show how many formula cells make that link; thicker edges
+mean more cells.
+"""
+
+import re
+import sys
+from openpyxl import load_workbook
+from openpyxl.utils import range_boundaries, get_column_letter, column_index_from_string
+
+DEFAULT_FILE = r"C:\Users\Mohamed.Faiz\Downloads\python stuff\FRB7_WKPR_2024.xlsx"
+DEFAULT_MIN_CELLS = 3
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+
+FULL_RANGE_ROW_CAP = 5000
+FULL_RANGE_COL_CAP = 200
+
+
+def _spans_overlap(span, other_spans):
+    s0, s1 = span
+    for a0, a1 in other_spans:
+        if s0 < a1 and a0 < s1:
+            return True
+    return False
+
+
+def extract_refs(formula, current_sheet, sheet_bounds):
+    refs = []
+    matched_spans = []
+
+    for m in CELL_REF_RE.finditer(formula):
+        matched_spans.append(m.span())
+        sheet = m.group(1) or m.group(2) or current_sheet
+        cell1 = m.group(3).replace('$', '')
+        cell2 = m.group(4)
+        if cell2:
+            cell2 = cell2.replace('$', '')
+            try:
+                min_col, min_row, max_col, max_row = range_boundaries(f"{cell1}:{cell2}")
+                for r in range(min_row, max_row + 1):
+                    for c in range(min_col, max_col + 1):
+                        refs.append((sheet, f"{get_column_letter(c)}{r}"))
+            except Exception:
+                continue
+        else:
+            refs.append((sheet, cell1))
+
+    for m in COLUMN_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        col1, col2 = m.group(3), m.group(4)
+        c1, c2 = column_index_from_string(col1), column_index_from_string(col2)
+        if c1 > c2:
+            c1, c2 = c2, c1
+        max_row = min(sheet_bounds.get(sheet, (FULL_RANGE_ROW_CAP, 1))[0], FULL_RANGE_ROW_CAP) or 1
+        for c in range(c1, c2 + 1):
+            col_letter = get_column_letter(c)
+            for r in range(1, max_row + 1):
+                refs.append((sheet, f"{col_letter}{r}"))
+
+    for m in ROW_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        row1, row2 = int(m.group(3)), int(m.group(4))
+        if row1 > row2:
+            row1, row2 = row2, row1
+        max_col = min(sheet_bounds.get(sheet, (1, FULL_RANGE_COL_CAP))[1], FULL_RANGE_COL_CAP) or 1
+        for r in range(row1, row2 + 1):
+            for c in range(1, max_col + 1):
+                refs.append((sheet, f"{get_column_letter(c)}{r}"))
+
+    return refs
+
+
+def load_formulas(path):
+    wb = load_workbook(path, data_only=False)
+    formulas = {}
+    sheet_bounds = {}
+    for ws in wb.worksheets:
+        sheet_bounds[ws.title] = (ws.max_row or 1, ws.max_column or 1)
+        for row in ws.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str) and cell.value.startswith('='):
+                    formulas[(ws.title, cell.coordinate)] = cell.value
+    return formulas, wb, sheet_bounds
+
+
+def build_sheet_flow(formulas, sheet_bounds):
+    flow = {}
+    for (sheet, cell), f in formulas.items():
+        refs = extract_refs(f, sheet, sheet_bounds)
+        source_sheets = set(s for s, c in refs)
+        for src in source_sheets:
+            if src == sheet:
+                continue
+            key = (src, sheet)
+            flow[key] = flow.get(key, 0) + 1
+    return flow
+
+
+import json
+import os
+from urllib.parse import quote
+
+
+def build_tree_html(flow, min_cells, workbook_path, out_file="sheet_tree.html"):
+    strong = {k: v for k, v in flow.items() if v >= min_cells}
+    if not strong:
+        print(f"No links with {min_cells}+ cells found - nothing to draw. Try a lower threshold.")
+        return None
+
+    all_sheets = set()
+    has_incoming = set()
+    has_outgoing = set()
+    for src, dst in strong:
+        all_sheets.add(src)
+        all_sheets.add(dst)
+        has_outgoing.add(src)
+        has_incoming.add(dst)
+
+    roots = all_sheets - has_incoming
+    leaves = all_sheets - has_outgoing
+
+    nodes = []
+    for sheet in all_sheets:
+        if sheet in roots:
+            color = "#2ecc71"  # green - root / likely input
+        elif sheet in leaves:
+            color = "#f39c12"  # orange - leaf / likely output
+        else:
+            color = "#2a9d8f"  # teal - in-between
+        nodes.append({
+            "id": sheet, "label": sheet, "color": color,
+            "shape": "box", "size": 25,
+            "title": f"{sheet}\\nClick to open this sheet in Excel"
+        })
+
+    max_count = max(strong.values())
+    edges = []
+    for (src, dst), count in strong.items():
+        width = 1 + (count / max_count) * 8
+        edges.append({
+            "from": src, "to": dst, "value": width,
+            "label": str(count), "title": f"{count} formula cells"
+        })
+
+    abs_path = os.path.abspath(workbook_path).replace("\\", "/")
+    file_url = "file:///" + quote(abs_path, safe=":/")
+
+    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)) \
+                         .replace("__EDGES__", json.dumps(edges)) \
+                         .replace("__FILE_URL__", json.dumps(file_url))
+
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    return out_file, file_url
+
+
+HTML_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body { margin:0; padding:0; background:#111111; }
+  #tree { width:100vw; height:100vh; }
+  #hint {
+    position:fixed; top:10px; left:10px; color:white; font-family:sans-serif;
+    font-size:14px; background:rgba(0,0,0,0.55); padding:8px 14px; border-radius:6px;
+    max-width: 480px;
+  }
+</style>
+</head>
+<body>
+<div id="hint">
+  Click a sheet box to open that sheet in Excel.<br>
+  Green = input sheet, orange = output sheet, teal = in-between.<br>
+  <span id="status" style="opacity:0.7;"></span>
+</div>
+<div id="tree"></div>
+<script type="text/javascript">
+  var nodes = new vis.DataSet(__NODES__);
+  var edges = new vis.DataSet(__EDGES__);
+  var container = document.getElementById('tree');
+  var data = { nodes: nodes, edges: edges };
+  var options = {
+    layout: {
+      hierarchical: {
+        enabled: true, direction: "UD", sortMethod: "directed",
+        levelSeparation: 160, nodeSpacing: 180, treeSpacing: 220
+      }
+    },
+    physics: {
+      hierarchicalRepulsion: { nodeDistance: 180 },
+      solver: "hierarchicalRepulsion"
+    },
+    edges: {
+      smooth: { type: "cubicBezier", forceDirection: "vertical" },
+      arrows: { to: { enabled: true } },
+      color: "#888888",
+      font: { color: "#ffffff" }
+    },
+    nodes: { font: { color: "#ffffff", size: 16 } }
+  };
+  var network = new vis.Network(container, data, options);
+  var fileUrl = __FILE_URL__;
+
+  network.on("click", function (params) {
+    if (params.nodes.length > 0) {
+      var sheetName = params.nodes[0];
+      var target = fileUrl + "#'" + sheetName.replace(/'/g, "''") + "'!A1";
+      document.getElementById('status').innerText = "Opening: " + sheetName + " ...";
+      window.location.href = target;
+    }
+  });
+</script>
+</body>
+</html>
+"""
+
+
+def main():
+    path = sys.argv[1] if len(sys.argv) >= 2 else DEFAULT_FILE
+    if len(sys.argv) < 2:
+        print(f"(No file given - using default: {path})")
+
+    min_cells = DEFAULT_MIN_CELLS
+    if len(sys.argv) >= 3:
+        try:
+            min_cells = int(sys.argv[2])
+        except ValueError:
+            pass
+
+    formulas, wb, sheet_bounds = load_formulas(path)
+    print(f"Loaded {len(formulas)} formulas across {len(wb.sheetnames)} sheet(s).")
+
+    flow = build_sheet_flow(formulas, sheet_bounds)
+    print(f"Found {len(flow)} distinct sheet-to-sheet links. Showing links with {min_cells}+ cells.")
+
+    result = build_tree_html(flow, min_cells, path)
+    if result:
+        out_file, file_url = result
+        print(f"\nTree written to {out_file} - open it in your browser (double-click it in File Explorer).")
+        print("Green = root sheet (input), orange = leaf sheet (output), teal = in-between. Edge label = cell count.")
+        print("Click a sheet box to try opening that sheet directly in Excel.")
+        print(f"(If clicking doesn't open Excel in your browser, it should still show a link like: {file_url}#'SheetName'!A1 -")
+        print(" you can paste that into Excel's address/open bar manually, or try a different browser - Edge tends to work best on Windows.)")
+
+
+if __name__ == "__main__":
+    main()
