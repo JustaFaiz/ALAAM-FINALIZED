@@ -1,0 +1,383 @@
+"""
+health_check.py
+-----------------
+Streamlit dashboard: drag in an Excel workbook, run a health check
+(broken links, circular references, orphaned sheets, hidden sheets,
+external data connections), see a scorecard + detail tables, and
+launch the interactive sheet-flow tree visual with one click.
+
+Requires:
+    pip install streamlit openpyxl
+    (pywin32 too, only needed by sheet_tree_server.py for the tree's
+    click-to-open-in-Excel feature - not needed by this dashboard itself)
+
+Usage:
+    streamlit run health_check.py
+
+Sheet_Tree_Server.py should be saved in the SAME FOLDER as this file
+so the "Open Sheet Flow Visual" button can find and launch it.
+"""
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
+
+import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+# ---------------------------------------------------------------
+# Formula parsing (same approach as trace_precedents.py / sheet_tree_server.py)
+# ---------------------------------------------------------------
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+
+FULL_RANGE_ROW_CAP = 5000
+FULL_RANGE_COL_CAP = 200
+
+
+def _spans_overlap(span, other_spans):
+    s0, s1 = span
+    for a0, a1 in other_spans:
+        if s0 < a1 and a0 < s1:
+            return True
+    return False
+
+
+def extract_refs(formula, current_sheet, sheet_bounds):
+    """Returns list of (sheet, cell, is_range). For any range (proper
+    range, full column, or full row), only the first and last cell are
+    returned - not every cell in between."""
+    refs = []
+    matched_spans = []
+
+    for m in CELL_REF_RE.finditer(formula):
+        matched_spans.append(m.span())
+        sheet = m.group(1) or m.group(2) or current_sheet
+        cell1 = m.group(3).replace('$', '')
+        cell2 = m.group(4)
+        if cell2:
+            cell2 = cell2.replace('$', '')
+            refs.append((sheet, cell1, True))
+            refs.append((sheet, cell2, True))
+        else:
+            refs.append((sheet, cell1, False))
+
+    for m in COLUMN_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        col1, col2 = m.group(3), m.group(4)
+        c1, c2 = column_index_from_string(col1), column_index_from_string(col2)
+        if c1 > c2:
+            c1, c2 = c2, c1
+        max_row = min(sheet_bounds.get(sheet, (FULL_RANGE_ROW_CAP, 1))[0], FULL_RANGE_ROW_CAP) or 1
+        refs.append((sheet, f"{get_column_letter(c1)}1", True))
+        refs.append((sheet, f"{get_column_letter(c2)}{max_row}", True))
+
+    for m in ROW_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        row1, row2 = int(m.group(3)), int(m.group(4))
+        if row1 > row2:
+            row1, row2 = row2, row1
+        max_col = min(sheet_bounds.get(sheet, (1, FULL_RANGE_COL_CAP))[1], FULL_RANGE_COL_CAP) or 1
+        refs.append((sheet, f"A{row1}", True))
+        refs.append((sheet, f"{get_column_letter(max_col)}{row2}", True))
+
+    return refs
+
+
+def load_workbook_data(path):
+    """Returns (formulas, values, sheet_names, hidden_sheets, sheet_bounds).
+    Uses read_only=True, which streams rows instead of building the full
+    in-memory object model - much faster on large workbooks."""
+    wb_f = load_workbook(path, data_only=False, read_only=True)
+    wb_v = load_workbook(path, data_only=True, read_only=True)
+    formulas, values, sheet_bounds = {}, {}, {}
+    hidden_sheets = []
+    for ws in wb_f.worksheets:
+        sheet_bounds[ws.title] = (ws.max_row or 1, ws.max_column or 1)
+        if ws.sheet_state != "visible":
+            hidden_sheets.append((ws.title, ws.sheet_state))
+        ws_v = wb_v[ws.title]
+        for row, row_v in zip(ws.iter_rows(), ws_v.iter_rows()):
+            for cell, cell_v in zip(row, row_v):
+                key = (ws.title, cell.coordinate)
+                if isinstance(cell.value, str) and cell.value.startswith('='):
+                    formulas[key] = cell.value
+                values[key] = cell_v.value
+    wb_f.close()
+    wb_v.close()
+    return formulas, values, wb_f.sheetnames, hidden_sheets, sheet_bounds
+
+
+def analyze_formulas(formulas, sheet_bounds):
+    """Parses every formula's references ONCE and derives both precedents
+    (for broken-link/cycle checks) and flow (for orphan check + sheet
+    diagram) from that same pass - previously these were computed by two
+    separate functions that each re-ran the same regex parsing."""
+    precedents = {}
+    flow = {}
+    for key, f in formulas.items():
+        sheet = key[0]
+        refs = extract_refs(f, sheet, sheet_bounds)
+        precedents[key] = refs
+        source_sheets = set(s for s, c, is_range in refs if s != sheet)
+        for src in source_sheets:
+            flow[(src, sheet)] = flow.get((src, sheet), 0) + 1
+    return precedents, flow
+
+
+# ---------------------------------------------------------------
+# Health checks
+# ---------------------------------------------------------------
+
+def check_broken_links(formulas, values, precedents):
+    """Only flags DIRECT single-cell references that are blank/missing -
+    same logic as trace_precedents.py. Range references are skipped since
+    blanks inside an aggregation range are normal."""
+    breaks = []
+    for (sheet, cell), refs in precedents.items():
+        for ref_sheet, ref_cell, is_range in refs:
+            if is_range:
+                continue
+            ref_key = (ref_sheet, ref_cell)
+            if ref_key not in values:
+                breaks.append((sheet, cell, ref_sheet, ref_cell, "cell not found (bad sheet name or out of range)"))
+            elif values[ref_key] is None and ref_key not in formulas:
+                breaks.append((sheet, cell, ref_sheet, ref_cell, "referenced cell is blank"))
+    return breaks
+
+
+def check_circular_refs(precedents):
+    """DFS-based cycle detection over direct single-cell references
+    (ranges excluded, since expanding them for cycle-checking would be
+    expensive and true range-based circularity is rare). Returns a list
+    of cycles found, each as a list of (sheet, cell) forming the loop."""
+    graph = {}
+    for key, refs in precedents.items():
+        graph[key] = [(s, c) for s, c, is_range in refs if not is_range]
+
+    GRAY, BLACK = 1, 2
+    color = {}
+    cycles = []
+
+    def dfs(start):
+        stack = [(start, iter(graph.get(start, [])))]
+        path = [start]
+        color[start] = GRAY
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for nxt in it:
+                advanced = True
+                if nxt not in color:
+                    color[nxt] = GRAY
+                    path.append(nxt)
+                    stack.append((nxt, iter(graph.get(nxt, []))))
+                    break
+                elif color[nxt] == GRAY:
+                    idx = path.index(nxt)
+                    cycles.append(path[idx:] + [nxt])
+                break
+            if not advanced:
+                color[node] = BLACK
+                stack.pop()
+                path.pop()
+
+    for node in list(graph.keys()):
+        if node not in color:
+            dfs(node)
+
+    return cycles[:20]  # cap - a workbook with many cycles doesn't need all listed
+
+
+def check_orphaned_sheets(sheet_names, flow):
+    connected = set()
+    for src, dst in flow:
+        connected.add(src)
+        connected.add(dst)
+    return [s for s in sheet_names if s not in connected]
+
+
+def check_external_connections(path):
+    """Reads xl/connections.xml directly from the xlsx zip - this is
+    where Excel stores Power Query / ODBC / SQL / web data connections.
+    Not visible to formula parsing since it's workbook metadata, not a
+    cell formula."""
+    connections = []
+    try:
+        with zipfile.ZipFile(path) as z:
+            if "xl/connections.xml" not in z.namelist():
+                return connections
+            with z.open("xl/connections.xml") as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+                ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+                for conn in root.findall(".//m:connection", ns):
+                    name = conn.get("name", "(unnamed)")
+                    conn_type = conn.get("type", "")
+                    db_pr = conn.find("m:dbPr", ns)
+                    detail = db_pr.get("connection") if db_pr is not None else ""
+                    connections.append((name, conn_type, detail or ""))
+    except Exception:
+        pass
+    return connections
+
+
+# ---------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------
+
+def main():
+    st.set_page_config(page_title="Workbook Health Check", layout="wide")
+    st.title("Excel Workbook Health Check")
+
+    uploaded = st.file_uploader("Drop your .xlsx or .xlsm workbook here", type=["xlsx", "xlsm"])
+    if uploaded is None:
+        st.info("Upload a workbook to run the health check.")
+        return
+
+    tmp_dir = tempfile.gettempdir()
+    tmp_path = os.path.join(tmp_dir, uploaded.name)
+    file_bytes = uploaded.getbuffer().tobytes()
+    with open(tmp_path, "wb") as f:
+        f.write(file_bytes)
+
+    st.success(f"Loaded: {uploaded.name}")
+
+    @st.cache_data(show_spinner=False)
+    def run_analysis(file_bytes, filename, path):
+        """Cached on file_bytes+filename - re-uploading or re-clicking
+        Run on the SAME unchanged file returns instantly instead of
+        re-parsing from scratch."""
+        formulas, values, sheet_names, hidden_sheets, sheet_bounds = load_workbook_data(path)
+        precedents, flow = analyze_formulas(formulas, sheet_bounds)
+        breaks = check_broken_links(formulas, values, precedents)
+        cycles = check_circular_refs(precedents)
+        orphans = check_orphaned_sheets(sheet_names, flow)
+        connections = check_external_connections(path)
+        return {
+            "formulas": len(formulas), "sheets": len(sheet_names),
+            "breaks": breaks, "cycles": cycles, "orphans": orphans,
+            "connections": connections, "hidden": hidden_sheets,
+        }
+
+    if st.button("Run Health Check", type="primary"):
+        with st.spinner("Analyzing workbook..."):
+            st.session_state["results"] = run_analysis(file_bytes, uploaded.name, tmp_path)
+
+    if "results" not in st.session_state:
+        return
+
+    r = st.session_state["results"]
+    st.caption(f"{r['formulas']} formulas across {r['sheets']} sheets")
+
+    def badge(count, label):
+        if count == 0:
+            st.success(f"OK - {label}: none found")
+        else:
+            st.error(f"! {label}: {count} found")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        badge(len(r["breaks"]), "Broken links")
+    with col2:
+        badge(len(r["cycles"]), "Circular refs")
+    with col3:
+        badge(len(r["orphans"]), "Orphaned sheets")
+    with col4:
+        st.warning(f"Hidden sheets: {len(r['hidden'])}") if r["hidden"] else st.success("OK - Hidden sheets: none")
+    with col5:
+        st.warning(f"External connections: {len(r['connections'])}") if r["connections"] else st.success("OK - External connections: none")
+
+    with st.expander(f"Broken links ({len(r['breaks'])})"):
+        if r["breaks"]:
+            st.dataframe(
+                [{"Sheet": s, "Cell": c, "Points to": f"{rs}!{rc}", "Issue": reason}
+                 for s, c, rs, rc, reason in r["breaks"]],
+                use_container_width=True,
+            )
+        else:
+            st.write("Every formula reference resolves to a value.")
+
+    with st.expander(f"Circular references ({len(r['cycles'])})"):
+        if r["cycles"]:
+            for cyc in r["cycles"]:
+                st.code(" -> ".join(f"{s}!{c}" for s, c in cyc))
+        else:
+            st.write("No circular references detected.")
+
+    with st.expander(f"Orphaned sheets ({len(r['orphans'])})"):
+        if r["orphans"]:
+            st.write("These sheets have no cross-sheet formula connections at all (nothing feeds them, they feed nothing):")
+            st.write(r["orphans"])
+        else:
+            st.write("Every sheet is connected to the flow.")
+
+    with st.expander(f"Hidden sheets ({len(r['hidden'])})"):
+        if r["hidden"]:
+            st.dataframe([{"Sheet": s, "State": state} for s, state in r["hidden"]], use_container_width=True)
+        else:
+            st.write("No hidden sheets.")
+
+    with st.expander(f"External data connections ({len(r['connections'])})"):
+        if r["connections"]:
+            st.write("These are the workbook's OWN entry points into outside data - the piece formula-tracing can't see past:")
+            st.dataframe(
+                [{"Name": n, "Type": t, "Connection detail": d} for n, t, d in r["connections"]],
+                use_container_width=True,
+            )
+        else:
+            st.write("No Power Query / ODBC / SQL / external connections found in this workbook.")
+
+    st.divider()
+    st.subheader("Sheet Flow Visual")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    tree_script_name = st.text_input("Tree visual script filename", value="Sheet_Tree_Server.py")
+    tree_script_path = os.path.join(script_dir, tree_script_name)
+
+    if st.button("Open Sheet Flow Visual"):
+        if not os.path.exists(tree_script_path):
+            st.error(f"Couldn't find {tree_script_name} in {script_dir}. Make sure it's saved in the same folder as this dashboard.")
+        else:
+            subprocess.Popen([sys.executable, tree_script_path, tmp_path])
+            st.success(f"Launched {tree_script_name} - check your browser for a new tab.")
+
+    report_lines = [
+        f"Workbook Health Check: {uploaded.name}",
+        f"{r['formulas']} formulas across {r['sheets']} sheets",
+        "",
+        f"Broken links: {len(r['breaks'])}",
+        f"Circular references: {len(r['cycles'])}",
+        f"Orphaned sheets: {len(r['orphans'])} - {r['orphans']}",
+        f"Hidden sheets: {len(r['hidden'])} - {[s for s, _ in r['hidden']]}",
+        f"External connections: {len(r['connections'])} - {[n for n, _, _ in r['connections']]}",
+    ]
+    st.download_button(
+        "Download Report (.txt)",
+        data="\n".join(report_lines),
+        file_name="health_check_report.txt",
+        mime="text/plain",
+    )
+
+
+if __name__ == "__main__":
+    main()
