@@ -1,0 +1,388 @@
+"""
+lineage_visual.py
+-------------------
+Interactive tree visualization of the Data Inventory tab's derivation
+graph (Stage + Derived From columns) from Data_Lineage_Template.xlsx -
+the manually-documented lineage, not auto-parsed formulas.
+
+Also flags "broken lineage links" - a Derived From value that points
+to a UIN# that doesn't actually exist as a row in the sheet (the
+documentation equivalent of a broken formula reference).
+
+Clicking a node shows that element's Lineage Hops chain (if any exist
+for its UIN#) in a side panel.
+
+Requires: pip install openpyxl
+
+Usage:
+    python lineage_visual.py Data_Lineage_Template.xlsx
+"""
+
+import json
+import sys
+import webbrowser
+
+from openpyxl import load_workbook
+
+STAGE_COLORS = {
+    "Input": "#2ecc71",
+    "Process": "#2a9d8f",
+    "Output": "#f39c12",
+}
+DEFAULT_COLOR = "#7f8c8d"
+MISSING_COLOR = "#e74c3c"
+
+
+def read_headers(ws):
+    headers = {}
+    for cell in ws[1]:
+        if cell.value:
+            headers[str(cell.value).strip()] = cell.column
+    return headers
+
+
+def load_data_inventory(path):
+    wb = load_workbook(path, data_only=True)
+    if "Data Inventory" not in wb.sheetnames:
+        print("No 'Data Inventory' tab found in this file.")
+        sys.exit(1)
+    ws = wb["Data Inventory"]
+    headers = read_headers(ws)
+
+    required = ["UIN#", "Data", "Stage", "Derived From (UIN#s)"]
+    missing = [h for h in required if h not in headers]
+    if missing:
+        print(f"Data Inventory tab is missing expected column(s): {missing}")
+        sys.exit(1)
+
+    elements = {}
+    for row in ws.iter_rows(min_row=2):
+        uin_cell = row[headers["UIN#"] - 1]
+        if not uin_cell.value:
+            continue
+        uin = str(uin_cell.value).strip()
+
+        def get(col_name, default=""):
+            idx = headers.get(col_name)
+            if idx is None:
+                return default
+            v = row[idx - 1].value
+            return str(v).strip() if v is not None else default
+
+        derived_from_raw = get("Derived From (UIN#s)")
+        derived_from = [d.strip() for d in derived_from_raw.split(",") if d.strip()]
+
+        elements[uin] = {
+            "uin": uin,
+            "name": get("Data", uin),
+            "stage": get("Stage"),
+            "derived_from": derived_from,
+            "system": get("System/Repository"),
+            "owner": get("Owner/Data provider"),
+            "purpose": get("Purpose"),
+            "volume": get("Volume"),
+            "manual_automated": get("Manual/Automated"),
+            "speed": get("Speed/Frequency (Input to Output)"),
+        }
+    wb.close()
+    return elements
+
+
+def load_hops(path):
+    wb = load_workbook(path, data_only=True)
+    if "Lineage Hops" not in wb.sheetnames:
+        wb.close()
+        return {}
+    ws = wb["Lineage Hops"]
+    headers = read_headers(ws)
+    hops = {}
+    for row in ws.iter_rows(min_row=2):
+        uin_cell = row[headers.get("UIN#", 1) - 1]
+        if not uin_cell.value:
+            continue
+        uin = str(uin_cell.value).strip()
+
+        def get(col_name, default=""):
+            idx = headers.get(col_name)
+            if idx is None:
+                return default
+            v = row[idx - 1].value
+            return v if v is not None else default
+
+        hops.setdefault(uin, []).append({
+            "hop": get("Hop #", ""),
+            "from": get("From (System/Location)", ""),
+            "to": get("To (System/Location)", ""),
+            "transformation": get("Transformation Description", ""),
+            "type": get("Transformation Type", ""),
+            "owner": get("Owner (this hop)", ""),
+        })
+    wb.close()
+    for uin in hops:
+        hops[uin].sort(key=lambda h: (h["hop"] if isinstance(h["hop"], (int, float)) else 999))
+    return hops
+
+
+def find_broken_links(elements):
+    broken = []
+    for uin, el in elements.items():
+        for parent in el["derived_from"]:
+            if parent not in elements:
+                broken.append((uin, el["name"], parent))
+    return broken
+
+
+HTML_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body { margin:0; padding:0; background:#111111; font-family:sans-serif; height:100%; overflow:hidden; }
+  #container { display:flex; height:100vh; width:100vw; }
+  #tree { flex: 3 1 0; height:100vh; }
+  #sidebar {
+    flex: 1 1 0; min-width:320px; max-width:420px; height:100vh; box-sizing:border-box;
+    background:#1a1a1a; color:white; padding:16px; overflow-y:auto;
+  }
+  #sidebar h2 { margin-top:0; font-size:18px; }
+  #sidebar h3 { font-size:16px; margin-bottom:4px; }
+  #sidebar h4 { font-size:14px; margin-bottom:4px; }
+  .hop-row { border-left:3px solid #FBCE07; padding:6px 10px; margin-bottom:8px; background:#232323; font-size:13px; }
+  .branch-row { padding:3px 0; font-size:13px; white-space:pre; }
+  .broken-item { color:#e74c3c; margin-bottom:4px; font-size:13px; }
+  #hint { font-size:13px; opacity:0.8; margin-bottom:14px; }
+  #clearBtn { cursor:pointer; text-decoration:underline; color:#FBCE07; font-size:13px; }
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="tree"></div>
+  <div id="sidebar">
+    <h2>Lineage Detail</h2>
+    <div id="hint">Click a node to highlight its full ancestor branch and see it listed below, plus any Lineage Hops. Green = Input, teal = Process, orange = Output, red = broken link.<br><span id="clearBtn">Clear selection</span></div>
+    <div id="brokenSection"></div>
+    <div id="detail">Click a node to begin.</div>
+  </div>
+</div>
+<script type="text/javascript">
+  var nodes = new vis.DataSet(__NODES__);
+  var edges = new vis.DataSet(__EDGES__);
+  var hopsData = __HOPS__;
+  var brokenLinks = __BROKEN__;
+
+  var container = document.getElementById('tree');
+  var data = { nodes: nodes, edges: edges };
+  var options = {
+    layout: {
+      hierarchical: {
+        enabled: true, direction: "LR", sortMethod: "directed",
+        levelSeparation: 220, nodeSpacing: 140, treeSpacing: 180
+      }
+    },
+    physics: {
+      hierarchicalRepulsion: { nodeDistance: 150 },
+      solver: "hierarchicalRepulsion"
+    },
+    edges: {
+      smooth: { type: "cubicBezier", forceDirection: "horizontal" },
+      arrows: { to: { enabled: true } },
+      color: "#888888"
+    },
+    nodes: { font: { color: "#ffffff", size: 14 } }
+  };
+  var network = new vis.Network(container, data, options);
+  network.once("stabilizationIterationsDone", function () {
+    network.setOptions({ physics: false });
+  });
+
+  var originalNodeColors = {};
+  nodes.forEach(function(n) { originalNodeColors[n.id] = n.color; });
+
+  var brokenDiv = document.getElementById('brokenSection');
+  if (brokenLinks.length > 0) {
+    var html = '<div style="margin-bottom:16px;"><b>Broken lineage links (' + brokenLinks.length + '):</b><br>';
+    brokenLinks.forEach(function(b) {
+      html += '<div class="broken-item">' + b[1] + ' (' + b[0] + ') references missing UIN# "' + b[2] + '"</div>';
+    });
+    html += '</div>';
+    brokenDiv.innerHTML = html;
+  }
+
+  // Walks the Derived-From chain backward from a node, collecting every
+  // ancestor. Returns {order: [...uin in branch order...], edgeIds: [...]}
+  function getAncestorBranch(startId) {
+    var visited = new Set([startId]);
+    var order = [startId];
+    var queue = [startId];
+    var edgeIds = [];
+    while (queue.length > 0) {
+      var current = queue.shift();
+      var incoming = edges.get({ filter: function(e) { return e.to === current; } });
+      incoming.forEach(function(e) {
+        edgeIds.push(e.id);
+        if (!visited.has(e.from)) {
+          visited.add(e.from);
+          order.push(e.from);
+          queue.push(e.from);
+        }
+      });
+    }
+    return { nodeIds: order, edgeIds: edgeIds };
+  }
+
+  function clearHighlight() {
+    var updates = [];
+    nodes.forEach(function(n) {
+      updates.push({ id: n.id, color: originalNodeColors[n.id], opacity: 1 });
+    });
+    nodes.update(updates);
+    var edgeUpdates = [];
+    edges.forEach(function(e) {
+      edgeUpdates.push({ id: e.id, color: { color: "#888888", opacity: 1 } });
+    });
+    edges.update(edgeUpdates);
+    document.getElementById('detail').innerHTML = 'Click a node to begin.';
+  }
+  document.getElementById('clearBtn').addEventListener('click', clearHighlight);
+
+  network.on("click", function (params) {
+    if (params.nodes.length === 0) return;
+    var uin = params.nodes[0];
+    var node = nodes.get(uin);
+    var branch = getAncestorBranch(uin);
+
+    // Dim everything, then re-highlight just the branch
+    var nodeUpdates = [];
+    nodes.forEach(function(n) {
+      if (branch.nodeIds.indexOf(n.id) >= 0) {
+        nodeUpdates.push({ id: n.id, color: originalNodeColors[n.id], opacity: 1 });
+      } else {
+        nodeUpdates.push({ id: n.id, color: "#3a3a3a", opacity: 0.3 });
+      }
+    });
+    nodes.update(nodeUpdates);
+
+    var edgeUpdates = [];
+    edges.forEach(function(e) {
+      if (branch.edgeIds.indexOf(e.id) >= 0) {
+        edgeUpdates.push({ id: e.id, color: { color: "#FBCE07", opacity: 1 } });
+      } else {
+        edgeUpdates.push({ id: e.id, color: { color: "#3a3a3a", opacity: 0.15 } });
+      }
+    });
+    edges.update(edgeUpdates);
+
+    // Sidebar: nested branch listing (this node, then each ancestor
+    // indented by how many hops back it is)
+    var detail = document.getElementById('detail');
+    var html = '<h3>' + node.label.replace(/\\n/g, ' ') + '</h3>';
+    if (node.title) html += '<p style="font-size:13px;">' + node.title.replace(/\\n/g, '<br>') + '</p>';
+
+    html += '<h4>Ancestor branch:</h4>';
+    var depthOf = {};
+    depthOf[uin] = 0;
+    var bfsQueue = [uin];
+    while (bfsQueue.length > 0) {
+      var cur = bfsQueue.shift();
+      var incoming = edges.get({ filter: function(e) { return e.to === cur; } });
+      incoming.forEach(function(e) {
+        if (!(e.from in depthOf)) {
+          depthOf[e.from] = depthOf[cur] + 1;
+          bfsQueue.push(e.from);
+        }
+      });
+    }
+    branch.nodeIds.slice().sort(function(a, b) { return depthOf[a] - depthOf[b]; }).forEach(function(nid) {
+      var n = nodes.get(nid);
+      var indent = '  '.repeat(depthOf[nid]);
+      var marker = depthOf[nid] === 0 ? '' : (indent + '\\u2514\\u2500 ');
+      html += '<div class="branch-row">' + marker + n.label.replace(/\\n/g, ' ') + '</div>';
+    });
+
+    var hopList = hopsData[uin];
+    if (hopList && hopList.length > 0) {
+      html += '<h4>Lineage Hops:</h4>';
+      hopList.forEach(function(h) {
+        html += '<div class="hop-row">Hop ' + h.hop + ': ' + h.from + ' &rarr; ' + h.to +
+                '<br><i>' + h.transformation + '</i>' +
+                (h.type ? '<br>Type: ' + h.type : '') +
+                (h.owner ? '<br>Owner: ' + h.owner : '') + '</div>';
+      });
+    } else {
+      html += '<h4>Lineage Hops:</h4><p><i>None recorded for this element.</i></p>';
+    }
+    detail.innerHTML = html;
+  });
+</script>
+</body>
+</html>
+"""
+
+
+def build_html(elements, hops, broken):
+    nodes = []
+    edges = []
+    seen = set()
+
+    for uin, el in elements.items():
+        color = STAGE_COLORS.get(el["stage"], DEFAULT_COLOR)
+        title = (f"System: {el['system']}\nOwner: {el['owner']}\nPurpose: {el['purpose']}\n"
+                 f"Volume: {el['volume']}\nManual/Automated: {el['manual_automated']}\n"
+                 f"Speed: {el['speed']}")
+        nodes.append({
+            "id": uin, "label": f"{el['name']}\n({uin})", "color": color,
+            "shape": "box", "title": title,
+        })
+        seen.add(uin)
+
+    for uin, el in elements.items():
+        for parent in el["derived_from"]:
+            if parent in elements:
+                edges.append({"from": parent, "to": uin})
+            else:
+                missing_id = f"MISSING:{parent}"
+                if missing_id not in seen:
+                    nodes.append({
+                        "id": missing_id, "label": f"MISSING\n({parent})",
+                        "color": MISSING_COLOR, "shape": "box",
+                        "title": "Referenced in Derived From but no matching UIN# row exists",
+                    })
+                    seen.add(missing_id)
+                edges.append({"from": missing_id, "to": uin, "color": {"color": MISSING_COLOR}})
+
+    return HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)) \
+                         .replace("__EDGES__", json.dumps(edges)) \
+                         .replace("__HOPS__", json.dumps(hops)) \
+                         .replace("__BROKEN__", json.dumps(broken))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python lineage_visual.py Data_Lineage_Template.xlsx")
+        sys.exit(1)
+    path = sys.argv[1]
+
+    elements = load_data_inventory(path)
+    hops = load_hops(path)
+    broken = find_broken_links(elements)
+
+    print(f"Loaded {len(elements)} element(s) from Data Inventory.")
+    if broken:
+        print(f"\n{len(broken)} broken lineage link(s) found:")
+        for uin, name, missing_parent in broken:
+            print(f"  {name} ({uin}) references missing UIN# '{missing_parent}'")
+    else:
+        print("No broken lineage links - every Derived From value matches a real UIN#.")
+
+    html = build_html(elements, hops, broken)
+    out_file = "lineage_graph.html"
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"\nWritten to {out_file} - opening in your browser now.")
+    webbrowser.open(out_file)
+
+
+if __name__ == "__main__":
+    main()
