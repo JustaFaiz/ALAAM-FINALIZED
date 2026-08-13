@@ -1,0 +1,333 @@
+"""
+generate_source_candidates.py
+-------------------------------
+Scans a real workbook and generates a Data Inventory starter file
+(matching the CA's format) pre-populated with one row per CANDIDATE
+input-data sheet - sheets nothing else in the workbook feeds into.
+These are your best starting list of "sheets to go ask someone about."
+
+This does NOT auto-detect where data actually came from (SAP, Longview,
+etc.) - that's fundamentally undiscoverable once data is pasted as
+static values, no tool can recover it. What this DOES do is find every
+sheet that's a likely raw-input point, so you're not manually scanning
+30 sheets to figure out which ones need a conversation - you just fill
+in System/Repository and Owner once you have the answer.
+
+Two candidate types get flagged, with a "Detected role" hint column:
+- Root sheets: nothing feeds them, but they feed other sheets (formulas
+  elsewhere pull from them)
+- Orphaned sheets: no cross-sheet formulas at all, in or out - often a
+  pure paste-only sheet with no formulas whatsoever
+
+Requires: pip install openpyxl
+
+Usage:
+    python generate_source_candidates.py workbook.xlsx
+"""
+
+import datetime
+import re
+import sys
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+FULL_RANGE_ROW_CAP = 5000
+FULL_RANGE_COL_CAP = 200
+
+# Detects references to a DIFFERENT workbook file entirely (not just
+# another sheet in this same file). Excel wraps the external file's
+# name (or an internal index number, since openpyxl often can't
+# resolve the actual filename from formula text alone) in square
+# brackets, e.g. ='[Budget2025.xlsx]Sheet1'!A1 or =[1]Sheet1!A1
+EXTERNAL_WORKBOOK_RE = re.compile(r'\[[^\[\]]+\]')
+
+# Captures the FULL external sheet identifier (file bracket + sheet
+# name together, e.g. "[Budget2025.xlsx]Sheet1") as a single unit, in
+# both the quoted and unquoted forms Excel uses. Must run BEFORE
+# CELL_REF_RE below - that regex's bare-identifier sheet pattern has
+# no brackets in it, so without this dedicated pass it silently
+# matches just the trailing sheet name and strips off the external
+# file part entirely, losing the "this is external" context.
+EXTERNAL_SHEET_REF_RE = re.compile(
+    r"(?:'(\[[^\[\]]+\][^']*)'|(\[[^\[\]]+\][A-Za-z_][A-Za-z0-9_]*))!"
+    r"(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?"
+)
+
+
+def _spans_overlap(span, other_spans):
+    s0, s1 = span
+    for a0, a1 in other_spans:
+        if s0 < a1 and a0 < s1:
+            return True
+    return False
+
+
+def extract_refs(formula, current_sheet, sheet_bounds):
+    refs = []
+    matched_spans = []
+
+    # External workbook references FIRST - see EXTERNAL_SHEET_REF_RE
+    # comment above for why this has to run before CELL_REF_RE.
+    for m in EXTERNAL_SHEET_REF_RE.finditer(formula):
+        matched_spans.append(m.span())
+        sheet = m.group(1) or m.group(2)
+        cell2 = m.group(4)
+        refs.append((sheet, bool(cell2)))
+
+    for m in CELL_REF_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        matched_spans.append(m.span())
+        sheet = m.group(1) or m.group(2) or current_sheet
+        cell1 = m.group(3).replace('$', '')
+        cell2 = m.group(4)
+        if cell2:
+            refs.append((sheet, True))
+        else:
+            refs.append((sheet, False))
+    for m in COLUMN_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        refs.append((sheet, True))
+    for m in ROW_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        refs.append((sheet, True))
+    return refs
+
+
+def classify_all_sheets(path):
+    """Classifies every sheet by how much of it is STRUCTURED (formulas)
+    vs UNSTRUCTURED (hardcoded numbers):
+    - External Input: has a formula linking to a DIFFERENT workbook file
+                (checked first, highest priority - a link to another
+                file is an unambiguous, concrete external source worth
+                flagging on its own, regardless of everything else)
+    - Isolated: no cross-sheet connections in EITHER direction - nothing
+                references this sheet, AND this sheet's own formulas
+                don't reference anything else either (checked second)
+    - Input:    0-40% structured (mostly hardcoded/pasted data)
+    - Process:  40-60% structured (a mix)
+    - Output:   60-100% structured (mostly formula-driven)
+
+    Structured % = formula cells / (formula cells + hardcoded NUMBER
+    cells). Blank cells, plain text, dates, and booleans are excluded
+    entirely - not counted in either the numerator or denominator. A
+    sheet full of text labels/headers with a couple of formulas
+    shouldn't look "unstructured" just because of the labels; text
+    isn't really "data" in the structured/unstructured sense at all.
+
+    Cross-sheet references (same workbook, different sheet) already
+    drive Isolated detection and the "Fed by" column above - this is
+    the same mechanism, just now ALSO driving the External Input stage
+    for links to other files entirely.
+
+    Returns list of (sheet_name, stage, fed_by_sheets, structured_pct,
+    structured_count, unstructured_count, external_workbook_refs).
+    """
+    # NOT read_only=True here deliberately: read-only mode trusts a
+    # stored "used range" tag in the file to decide how far to scan,
+    # which can be stale (especially after row deletions or files not
+    # saved by Excel itself) - silently missing real data sitting past
+    # where that tag claims the sheet ends. Normal mode fully parses
+    # every actual cell regardless of that tag, which matters more here
+    # than raw speed.
+    wb = load_workbook(path, data_only=False)
+    all_sheets = wb.sheetnames
+    sheet_bounds = {}
+    has_incoming = set()  # this sheet's own formulas reference another sheet
+    has_outgoing = set()  # this sheet IS referenced by some other sheet's formula
+    fed_by = {}
+    formula_counts = {}
+    nonblank_counts = {}
+
+    for ws in wb.worksheets:
+        sheet_bounds[ws.title] = (ws.max_row or 1, ws.max_column or 1)
+
+    external_ref_counts = {}
+    for ws in wb.worksheets:
+        formula_count = 0
+        unstructured_count = 0
+        external_count = 0
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                if v is None:
+                    continue  # blank - excluded
+                if isinstance(v, str) and v.startswith('='):
+                    formula_count += 1
+                    if EXTERNAL_WORKBOOK_RE.search(v):
+                        external_count += 1
+                    for ref_sheet, is_range in extract_refs(v, ws.title, sheet_bounds):
+                        if ref_sheet != ws.title:
+                            has_incoming.add(ws.title)
+                            has_outgoing.add(ref_sheet)
+                            fed_by.setdefault(ws.title, set()).add(ref_sheet)
+                elif isinstance(v, bool):
+                    continue  # booleans excluded
+                elif isinstance(v, (int, float)):
+                    unstructured_count += 1  # a hardcoded number
+                elif isinstance(v, (datetime.date, datetime.datetime)):
+                    continue  # dates excluded
+                else:
+                    continue  # plain text (or anything else) excluded entirely
+        formula_counts[ws.title] = formula_count
+        nonblank_counts[ws.title] = formula_count + unstructured_count
+        external_ref_counts[ws.title] = external_count
+    wb.close()
+
+    results = []
+    for sheet in all_sheets:
+        classified_total = nonblank_counts.get(sheet, 0)
+        formula = formula_counts.get(sheet, 0)
+        pct = (formula / classified_total * 100) if classified_total > 0 else 0.0
+
+        structured_count = formula
+        unstructured_count = classified_total - formula
+        external_refs = external_ref_counts.get(sheet, 0)
+
+        if external_refs > 0:
+            stage = "External Input"
+        elif sheet not in has_incoming and sheet not in has_outgoing:
+            stage = "Isolated"
+        elif pct < 40:
+            stage = "Input"
+        elif pct < 60:
+            stage = "Process"
+        else:
+            stage = "Output"
+
+        results.append((sheet, stage, fed_by.get(sheet, set()), round(pct, 1),
+                         structured_count, unstructured_count, external_refs))
+    return results
+
+
+# ---------------------------------------------------------------
+# Output file - matches Data_Lineage_Template.xlsx's Data Inventory tab
+# ---------------------------------------------------------------
+
+FONT_NAME = "Arial"
+HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
+HEADER_FONT = Font(name=FONT_NAME, size=10, bold=True, color="FFFFFF")
+INPUT_FILL = PatternFill("solid", fgColor="FFFF00")
+NORMAL_FONT = Font(name=FONT_NAME, size=10)
+THIN = Side(style="thin", color="B7B7B7")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+WRAP = Alignment(wrap_text=True, vertical="top")
+CENTER = Alignment(horizontal="center", vertical="center")
+
+
+def build_output(sheets, out_path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data Inventory - To Fill"
+
+    headers = ["UIN#", "Data", "System/Repository", "Owner/Data provider",
+               "Purpose", "Data type", "Stage", "Structured %",
+               "Structured Cells", "Unstructured Cells", "External Workbook Refs",
+               "Fed by (sheets, if any)"]
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=1, column=i, value=h)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = CENTER
+        c.border = BORDER
+
+    # Needs-a-conversation rows (Input/Isolated) get the yellow "please
+    # fill in" treatment on the source columns. Process/Output rows
+    # already have a traceable origin (shown in "Fed by"), so those
+    # columns are left unhighlighted - informational, not a to-do.
+    # A sheet with External Workbook Refs also gets that cell highlighted
+    # regardless of stage, since a link to another FILE is itself an
+    # input source worth investigating even on an otherwise-traceable sheet.
+    for r_off, (sheet_name, stage, fed_by_set, structured_pct, structured_count,
+                unstructured_count, external_refs) in enumerate(sheets):
+        r = 2 + r_off
+        uin = f"SRC-{r_off + 1:03d}"
+        fed_by_text = ", ".join(sorted(fed_by_set)) if fed_by_set else ""
+        row_vals = [uin, sheet_name, "", "", "", "", stage, f"{structured_pct}%",
+                    structured_count, unstructured_count, external_refs, fed_by_text]
+        needs_source = stage in ("External Input", "Input", "Isolated")
+        for i, v in enumerate(row_vals, start=1):
+            c = ws.cell(row=r, column=i, value=v)
+            c.border = BORDER
+            c.alignment = WRAP
+            c.font = NORMAL_FONT
+            if needs_source and i in (3, 4, 5, 6):  # System/Repository, Owner, Purpose, Data type
+                c.fill = INPUT_FILL
+            if i == 11 and external_refs > 0:  # External Workbook Refs
+                c.fill = INPUT_FILL
+
+    ws.freeze_panes = "A2"
+    ws.column_dimensions["A"].width = 12
+    ws.column_dimensions["B"].width = 26
+    ws.column_dimensions["C"].width = 20
+    ws.column_dimensions["D"].width = 20
+    ws.column_dimensions["E"].width = 30
+    ws.column_dimensions["F"].width = 16
+    ws.column_dimensions["G"].width = 12
+    ws.column_dimensions["H"].width = 12
+    ws.column_dimensions["I"].width = 14
+    ws.column_dimensions["J"].width = 16
+    ws.column_dimensions["K"].width = 18
+    ws.column_dimensions["L"].width = 35
+
+    wb.save(out_path)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python generate_source_candidates.py workbook.xlsx")
+        sys.exit(1)
+    path = sys.argv[1]
+
+    print(f"Scanning {path} and classifying every sheet by structured %...")
+    sheets = classify_all_sheets(path)
+
+    STAGE_ORDER = {"External Input": 0, "Input": 1, "Process": 2, "Output": 3, "Isolated": 4}
+    sheets.sort(key=lambda s: STAGE_ORDER[s[1]])
+
+    counts = {"External Input": 0, "Input": 0, "Process": 0, "Output": 0, "Isolated": 0}
+    for _, stage, _, _, _, _, _ in sheets:
+        counts[stage] += 1
+    print(f"\n{len(sheets)} sheet(s) total: {counts['External Input']} External Input, "
+          f"{counts['Input']} Input, {counts['Process']} Process, "
+          f"{counts['Output']} Output, {counts['Isolated']} Isolated\n")
+
+    needs_conversation = [s for s in sheets if s[1] in ("External Input", "Input", "Isolated")]
+    print(f"{len(needs_conversation)} sheet(s) need a conversation (no traceable source in-file):")
+    for name, stage, _, pct, _, _, ext_refs in needs_conversation:
+        ext_note = f"  [{ext_refs} external workbook ref(s)]" if ext_refs > 0 else ""
+        print(f"  {name}  -  {stage}  ({pct}% structured){ext_note}")
+
+    print("\nRemaining sheets (Process/Output) already have a traceable source within the workbook:")
+    for name, stage, fed_by_set, pct, _, _, ext_refs in sheets:
+        if stage in ("Process", "Output"):
+            fed_by_text = ", ".join(sorted(fed_by_set)) if fed_by_set else "(none)"
+            ext_note = f"  [{ext_refs} external workbook ref(s)]" if ext_refs > 0 else ""
+            print(f"  {name}  -  {stage}  ({pct}% structured)  -  fed by: {fed_by_text}{ext_note}")
+
+    out_path = "Data_Inventory_Candidates.xlsx"
+    build_output(sheets, out_path)
+    print(f"\nWritten to {out_path} - every sheet is listed with its Stage; yellow cells on "
+          "Input/Isolated rows are what to fill in after asking around.")
+
+
+if __name__ == "__main__":
+    main()
