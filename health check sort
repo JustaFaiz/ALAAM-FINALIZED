@@ -1,0 +1,723 @@
+"""
+health_check.py
+-----------------
+Streamlit dashboard: drag in an Excel workbook, run a health check
+(broken links, circular references, isolated sheets, hidden sheets,
+external data connections), see a scorecard + detail tables, and
+launch the interactive sheet-flow tree visual with one click.
+
+Requires:
+    pip install streamlit openpyxl
+    (pywin32 too, only needed by sheet_tree_server.py for the tree's
+    click-to-open-in-Excel feature - not needed by this dashboard itself)
+
+Usage:
+    streamlit run health_check.py
+
+Sheet_Trace_Visual_6.py should be saved in the SAME FOLDER as this file
+so the "Open Sheet Flow Visual" button can find and launch it.
+"""
+
+import datetime
+import importlib.util
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
+
+import streamlit as st
+from streamlit_sortables import sort_items
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+# ---------------------------------------------------------------
+# Formula parsing (same approach as trace_precedents.py / sheet_tree_server.py)
+# ---------------------------------------------------------------
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+
+FULL_RANGE_ROW_CAP = 5000
+FULL_RANGE_COL_CAP = 200
+
+
+def _spans_overlap(span, other_spans):
+    s0, s1 = span
+    for a0, a1 in other_spans:
+        if s0 < a1 and a0 < s1:
+            return True
+    return False
+
+
+def extract_refs(formula, current_sheet, sheet_bounds):
+    """Returns list of (sheet, cell, is_range). For any range (proper
+    range, full column, or full row), only the first and last cell are
+    returned - not every cell in between."""
+    refs = []
+    matched_spans = []
+
+    for m in CELL_REF_RE.finditer(formula):
+        matched_spans.append(m.span())
+        sheet = m.group(1) or m.group(2) or current_sheet
+        cell1 = m.group(3).replace('$', '')
+        cell2 = m.group(4)
+        if cell2:
+            cell2 = cell2.replace('$', '')
+            refs.append((sheet, cell1, True))
+            refs.append((sheet, cell2, True))
+        else:
+            refs.append((sheet, cell1, False))
+
+    for m in COLUMN_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        col1, col2 = m.group(3), m.group(4)
+        c1, c2 = column_index_from_string(col1), column_index_from_string(col2)
+        if c1 > c2:
+            c1, c2 = c2, c1
+        max_row = min(sheet_bounds.get(sheet, (FULL_RANGE_ROW_CAP, 1))[0], FULL_RANGE_ROW_CAP) or 1
+        refs.append((sheet, f"{get_column_letter(c1)}1", True))
+        refs.append((sheet, f"{get_column_letter(c2)}{max_row}", True))
+
+    for m in ROW_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        row1, row2 = int(m.group(3)), int(m.group(4))
+        if row1 > row2:
+            row1, row2 = row2, row1
+        max_col = min(sheet_bounds.get(sheet, (1, FULL_RANGE_COL_CAP))[1], FULL_RANGE_COL_CAP) or 1
+        refs.append((sheet, f"A{row1}", True))
+        refs.append((sheet, f"{get_column_letter(max_col)}{row2}", True))
+
+    return refs
+
+
+def load_workbook_data(path):
+    """Returns (formulas, sheet_names, hidden_sheets, sheet_bounds).
+    Only reads formulas - no longer loads cell VALUES at all, since
+    blank-cell content isn't checked anymore (per manager's guidance,
+    a reference to an intentionally-blank cell isn't a "broken link" -
+    only a reference to a genuinely invalid cell/sheet is). This also
+    means only ONE pass over the workbook is needed now, not two."""
+    wb_f = load_workbook(path, data_only=False, read_only=True)
+    formulas, sheet_bounds = {}, {}
+    hidden_sheets = []
+    for ws in wb_f.worksheets:
+        max_row = ws.max_row or 1
+        max_col = ws.max_column or 1
+        sheet_bounds[ws.title] = (max_row, max_col)
+        if ws.sheet_state != "visible":
+            hidden_sheets.append((ws.title, ws.sheet_state))
+
+        rows_f = ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)
+        for r_idx, row in enumerate(rows_f, start=1):
+            for c_idx, cell in enumerate(row, start=1):
+                if isinstance(cell.value, str) and cell.value.startswith('='):
+                    coord = f"{get_column_letter(c_idx)}{r_idx}"
+                    formulas[(ws.title, coord)] = cell.value
+    wb_f.close()
+    return formulas, wb_f.sheetnames, hidden_sheets, sheet_bounds
+
+
+def analyze_formulas(formulas, sheet_bounds):
+    """Parses every formula's references ONCE and derives both precedents
+    (for broken-link/cycle checks) and flow (for isolated-sheet check + sheet
+    diagram) from that same pass - previously these were computed by two
+    separate functions that each re-ran the same regex parsing."""
+    precedents = {}
+    flow = {}
+    for key, f in formulas.items():
+        sheet = key[0]
+        refs = extract_refs(f, sheet, sheet_bounds)
+        precedents[key] = refs
+        source_sheets = set(s for s, c, is_range in refs if s != sheet)
+        for src in source_sheets:
+            flow[(src, sheet)] = flow.get((src, sheet), 0) + 1
+    return precedents, flow
+
+
+# ---------------------------------------------------------------
+# Health checks
+# ---------------------------------------------------------------
+
+def check_broken_links(formulas):
+    """Flags formulas that literally contain Excel's own #REF! error
+    marker - this is what Excel writes into a formula's text when a
+    referenced cell/row/column/sheet has been deleted, making the
+    reference genuinely invalid. This is the only fully reliable signal
+    of a real broken link: every other cell address is technically
+    valid in Excel whether it currently holds data or not, so range or
+    blank-cell heuristics produce false positives on ordinary formulas
+    referencing not-yet-filled-in cells. Per manager's guidance, those
+    are not flagged - only genuine #REF! breaks are."""
+    breaks = []
+    for (sheet, cell), f in formulas.items():
+        if "#REF!" in f.upper():
+            breaks.append((sheet, cell, f))
+    return breaks
+
+
+def check_circular_refs(precedents):
+    """DFS-based cycle detection over direct single-cell references
+    (ranges excluded, since expanding them for cycle-checking would be
+    expensive and true range-based circularity is rare). Returns a list
+    of cycles found, each as a list of (sheet, cell) forming the loop."""
+    graph = {}
+    for key, refs in precedents.items():
+        graph[key] = [(s, c) for s, c, is_range in refs if not is_range]
+
+    GRAY, BLACK = 1, 2
+    color = {}
+    cycles = []
+
+    def dfs(start):
+        stack = [(start, iter(graph.get(start, [])))]
+        path = [start]
+        color[start] = GRAY
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for nxt in it:
+                advanced = True
+                if nxt not in color:
+                    color[nxt] = GRAY
+                    path.append(nxt)
+                    stack.append((nxt, iter(graph.get(nxt, []))))
+                    break
+                elif color[nxt] == GRAY:
+                    idx = path.index(nxt)
+                    cycles.append(path[idx:] + [nxt])
+                break
+            if not advanced:
+                color[node] = BLACK
+                stack.pop()
+                path.pop()
+
+    for node in list(graph.keys()):
+        if node not in color:
+            dfs(node)
+
+    return cycles[:20]  # cap - a workbook with many cycles doesn't need all listed
+
+
+def derive_connectivity_stage(sheet_names, flow):
+    """Classifies each sheet by CONNECTIVITY ALONE (same signal the tree
+    visual uses for root/leaf/middle coloring) - completely independent
+    of the structured-%-based Source Classification:
+    - Input:    feeds other sheets, nothing feeds it
+    - Process:  both receives from and feeds into other sheets
+    - Output:   receives from other sheets, feeds nothing further
+    - Isolated: no cross-sheet connections at all
+    Returns a dict: sheet_name -> stage."""
+    has_incoming = set()
+    has_outgoing = set()
+    for src, dst in flow:
+        has_outgoing.add(src)
+        has_incoming.add(dst)
+
+    stages = {}
+    for sheet in sheet_names:
+        incoming = sheet in has_incoming
+        outgoing = sheet in has_outgoing
+        if incoming and outgoing:
+            stages[sheet] = "Process"
+        elif outgoing and not incoming:
+            stages[sheet] = "Input"
+        elif incoming and not outgoing:
+            stages[sheet] = "Output"
+        else:
+            stages[sheet] = "Isolated"
+    return stages
+
+
+def check_isolated_sheets(sheet_names, flow):
+    connected = set()
+    for src, dst in flow:
+        connected.add(src)
+        connected.add(dst)
+    return [s for s in sheet_names if s not in connected]
+
+
+def check_external_connections(path):
+    """Reads xl/connections.xml directly from the xlsx zip - this is
+    where Excel stores Power Query / ODBC / SQL / web data connections.
+    Not visible to formula parsing since it's workbook metadata, not a
+    cell formula."""
+    connections = []
+    try:
+        with zipfile.ZipFile(path) as z:
+            if "xl/connections.xml" not in z.namelist():
+                return connections
+            with z.open("xl/connections.xml") as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+                ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+                for conn in root.findall(".//m:connection", ns):
+                    name = conn.get("name", "(unnamed)")
+                    conn_type = conn.get("type", "")
+                    db_pr = conn.find("m:dbPr", ns)
+                    detail = db_pr.get("connection") if db_pr is not None else ""
+                    connections.append((name, conn_type, detail or ""))
+    except Exception:
+        pass
+    return connections
+
+
+# ---------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------
+
+SHELL_YELLOW = "#FBCE07"
+SHELL_RED = "#DD1D21"
+SHELL_DARK = "#1A1A1A"
+
+
+def apply_shell_theme():
+    st.markdown(
+        f"""
+        <style>
+        .stButton>button {{
+            background-color: {SHELL_RED};
+            color: white;
+            border: 2px solid {SHELL_YELLOW};
+            font-weight: bold;
+        }}
+        .stButton>button:hover {{
+            background-color: {SHELL_YELLOW};
+            color: {SHELL_DARK};
+            border: 2px solid {SHELL_RED};
+        }}
+        .shell-banner {{
+            background-color: {SHELL_RED};
+            color: white;
+            padding: 14px 20px;
+            border-radius: 6px;
+            border-left: 10px solid {SHELL_YELLOW};
+            font-size: 28px;
+            font-weight: bold;
+            margin-bottom: 20px;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def shell_box(text, ok):
+    """Status box: yellow = OK, red = issue found. No default
+    Streamlit green anywhere - just the two Shell brand colors."""
+    bg = SHELL_YELLOW if ok else SHELL_RED
+    fg = SHELL_DARK if ok else "white"
+    st.markdown(
+        f'<div style="background-color:{bg}; color:{fg}; padding:10px 14px; '
+        f'border-radius:6px; font-weight:bold; margin-bottom:8px;">{text}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def main():
+    st.set_page_config(page_title="Workbook Health Check", layout="wide")
+    apply_shell_theme()
+    st.markdown('<div class="shell-banner">Excel Workbook Health Check</div>', unsafe_allow_html=True)
+
+    uploaded = st.file_uploader("Drop your .xlsx or .xlsm workbook here", type=["xlsx", "xlsm"])
+    if uploaded is None:
+        shell_box("Upload a workbook to run the health check.", ok=True)
+        return
+
+    tmp_dir = tempfile.gettempdir()
+    tmp_path = os.path.join(tmp_dir, uploaded.name)
+    file_bytes = uploaded.getbuffer().tobytes()
+    with open(tmp_path, "wb") as f:
+        f.write(file_bytes)
+
+    shell_box(f"Loaded: {uploaded.name}", ok=True)
+
+    @st.cache_data(show_spinner=False)
+    def run_analysis(file_bytes, filename, path):
+        """Cached on file_bytes+filename - re-uploading or re-clicking
+        Run on the SAME unchanged file returns instantly instead of
+        re-parsing from scratch."""
+        formulas, sheet_names, hidden_sheets, sheet_bounds = load_workbook_data(path)
+        precedents, flow = analyze_formulas(formulas, sheet_bounds)
+        breaks = check_broken_links(formulas)
+        cycles = check_circular_refs(precedents)
+        isolated = check_isolated_sheets(sheet_names, flow)
+        connections = check_external_connections(path)
+        connectivity_stage = derive_connectivity_stage(sheet_names, flow)
+        return {
+            "formulas": len(formulas), "sheets": len(sheet_names),
+            "sheet_names": sheet_names,
+            "breaks": breaks, "cycles": cycles, "isolated": isolated,
+            "connections": connections, "hidden": hidden_sheets,
+            "connectivity_stage": connectivity_stage,
+        }
+
+    if st.button("Run Health Check", type="primary"):
+        with st.spinner("Analyzing workbook..."):
+            st.session_state["results"] = run_analysis(file_bytes, uploaded.name, tmp_path)
+
+    if "results" not in st.session_state:
+        return
+
+    r = st.session_state["results"]
+    st.caption(f"{r['formulas']} formulas across {r['sheets']} sheets")
+
+    def badge(count, label):
+        shell_box(f"{label}: {count} found" if count else f"{label}: none found", ok=(count == 0))
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        badge(len(r["breaks"]), "Broken links")
+    with col2:
+        badge(len(r["cycles"]), "Circular refs")
+    with col3:
+        badge(len(r["isolated"]), "Isolated sheets")
+    with col4:
+        badge(len(r["hidden"]), "Hidden sheets")
+    with col5:
+        badge(len(r["connections"]), "External connections")
+
+    with st.expander(f"Broken links ({len(r['breaks'])})"):
+        if r["breaks"]:
+            st.write("Formulas containing Excel's own #REF! error marker (a reference that was deleted/invalidated):")
+            st.dataframe(
+                [{"Sheet": s, "Cell": c, "Formula": f} for s, c, f in r["breaks"]],
+                use_container_width=True,
+            )
+        else:
+            st.write("No #REF! errors found - no genuinely broken references.")
+
+    with st.expander(f"Circular references ({len(r['cycles'])})"):
+        if r["cycles"]:
+            for cyc in r["cycles"]:
+                st.code(" -> ".join(f"{s}!{c}" for s, c in cyc))
+        else:
+            st.write("No circular references detected.")
+
+    with st.expander(f"Isolated sheets ({len(r['isolated'])})"):
+        if r["isolated"]:
+            st.write("These sheets have no cross-sheet formula connections at all (nothing feeds them, they feed nothing):")
+            st.dataframe([{"Sheet": s} for s in r["isolated"]], use_container_width=True)
+        else:
+            st.write("Every sheet is connected to the flow.")
+
+    with st.expander(f"Hidden sheets ({len(r['hidden'])})"):
+        if r["hidden"]:
+            st.dataframe([{"Sheet": s, "State": state} for s, state in r["hidden"]], use_container_width=True)
+        else:
+            st.write("No hidden sheets.")
+
+    with st.expander(f"External data connections ({len(r['connections'])})"):
+        if r["connections"]:
+            st.write("These are the workbook's OWN entry points into outside data - the piece formula-tracing can't see past:")
+            st.dataframe(
+                [{"Name": n, "Type": t, "Connection detail": d} for n, t, d in r["connections"]],
+                use_container_width=True,
+            )
+        else:
+            st.write("No Power Query / ODBC / SQL / external connections found in this workbook.")
+
+    st.divider()
+    st.subheader("Sheet Flow Visual")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    tree_script_name = st.text_input("Tree visual script filename", value="Sheet_Trace_Visual_6.py")
+    tree_script_path = os.path.join(script_dir, tree_script_name)
+
+    if st.button("Open Sheet Flow Visual"):
+        if not os.path.exists(tree_script_path):
+            shell_box(f"Couldn't find {tree_script_name} in {script_dir}. Make sure it's saved in the same folder as this dashboard.", ok=False)
+        else:
+            subprocess.Popen([sys.executable, tree_script_path, tmp_path])
+            shell_box(f"Launched {tree_script_name} - check your browser for a new tab.", ok=True)
+
+    # -----------------------------------------------------------
+    # Source Classification - runs INLINE (imported directly, not
+    # launched as a separate process), reusing the SAME uploaded
+    # workbook already on this page. Results show right here as a
+    # table. Download button lives in its own section below.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Source Classification")
+    sc_script_name = st.text_input("Source Candidates script filename", value="Source_Candidates_1.py", key="sc_script_name")
+    sc_script_path = os.path.join(script_dir, sc_script_name)
+
+    if st.button("Run Source Classification"):
+        if not os.path.exists(sc_script_path):
+            shell_box(f"Couldn't find {sc_script_name} in {script_dir}. Make sure it's saved in the same folder as this dashboard.", ok=False)
+        else:
+            with st.spinner("Classifying sheets..."):
+                spec = importlib.util.spec_from_file_location("generate_source_candidates", sc_script_path)
+                gsc = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(gsc)
+
+                sheets_result = gsc.classify_all_sheets(tmp_path)
+                stage_order = {"External Input": 0, "Input": 1, "Process": 2, "Output": 3, "Isolated": 4}
+                sheets_result.sort(key=lambda s: stage_order[s[1]])
+
+                candidates_path = os.path.join(tmp_dir, "Data_Inventory_Candidates.xlsx")
+                gsc.build_output(sheets_result, candidates_path)
+
+            st.session_state["source_candidates"] = sheets_result
+            st.session_state["source_candidates_file"] = candidates_path
+
+    if "source_candidates" in st.session_state:
+        sc = st.session_state["source_candidates"]
+        st.dataframe(
+            [{"Sheet": name, "Stage": stage, "Structured %": f"{pct}%",
+              "Structured Cells": sc_count, "Unstructured Cells": unsc_count,
+              "Volume": vol, "External Refs": ext, "Fed by": ", ".join(sorted(fed)) if fed else ""}
+             for name, stage, fed, pct, sc_count, unsc_count, vol, ext in sc],
+            use_container_width=True,
+        )
+
+    # -----------------------------------------------------------
+    # Download Data Inventory Candidates - its own separate section,
+    # only shows once a classification has actually been run above.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Download Data Inventory Candidates")
+    if "source_candidates_file" in st.session_state:
+        with open(st.session_state["source_candidates_file"], "rb") as f:
+            st.download_button(
+                "Download Data_Inventory_Candidates.xlsx",
+                data=f.read(),
+                file_name="Data_Inventory_Candidates.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+    else:
+        st.caption("Run Source Classification above first to generate a file to download.")
+
+    # -----------------------------------------------------------
+    # Lineage Visualizer - LAUNCHED (same pattern as Sheet Flow
+    # Visual), since it's a custom interactive graph, not something
+    # that fits Streamlit's own widgets. Needs its OWN upload since
+    # it reads a filled-in lineage template, not the raw workpaper.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Lineage Visualizer")
+    st.caption("Uses a separate, manually-filled Data Inventory / Lineage Hops file - not the workbook uploaded above.")
+    lineage_upload = st.file_uploader("Drop your Data Lineage Template (.xlsx)", type=["xlsx"], key="lineage_upload")
+    lv_script_name = st.text_input("Lineage visual script filename", value="Lineage_Visual.py", key="lv_script_name")
+
+    if lineage_upload is not None:
+        lineage_tmp_path = os.path.join(tmp_dir, lineage_upload.name)
+        with open(lineage_tmp_path, "wb") as f:
+            f.write(lineage_upload.getbuffer())
+        lv_script_path = os.path.join(script_dir, lv_script_name)
+
+        if st.button("Open Lineage Visual"):
+            if not os.path.exists(lv_script_path):
+                shell_box(f"Couldn't find {lv_script_name} in {script_dir}. Make sure it's saved in the same folder as this dashboard.", ok=False)
+            else:
+                subprocess.Popen([sys.executable, lv_script_path, lineage_tmp_path])
+                shell_box(f"Launched {lv_script_name} - check your browser for a new tab.", ok=True)
+
+    # -----------------------------------------------------------
+    # Manual Classification & Comparison - drag sheets into Input/
+    # Process/Output by hand (ground truth from actual domain
+    # knowledge), then compare against the two AUTOMATED methods:
+    # connectivity-based (same signal the tree visual's root/leaf/
+    # middle coloring uses) and Source Classification (structured %).
+    # This surfaces where the automated heuristics agree with reality
+    # and where they don't - real evidence, not just tool output.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Manual Classification & Comparison")
+    st.caption("Drag each sheet into Input, Process, or Output based on what you actually know about it, then compare against the two automated classifications.")
+
+    sheet_names = r.get("sheet_names", [])
+    if sheet_names:
+        initial_containers = {
+            "Unclassified": list(sheet_names),
+            "Input": [],
+            "Process": [],
+            "Output": [],
+        }
+        sorted_result = sort_items(
+            initial_containers,
+            multi_containers=True,
+            direction="vertical",
+            key="manual_classification_sortable",
+        )
+
+        if st.button("Compare Classifications"):
+            manual_map = {}
+            for bucket, items in sorted_result.items():
+                if bucket == "Unclassified":
+                    continue
+                for sheet in items:
+                    manual_map[sheet] = bucket
+
+            unclassified_count = len(sorted_result.get("Unclassified", []))
+            if unclassified_count:
+                st.caption(f"({unclassified_count} sheet(s) still in Unclassified - only classified sheets are compared below.)")
+
+            connectivity_stage = r.get("connectivity_stage", {})
+            source_stage = {}
+            if "source_candidates" in st.session_state:
+                for name, stage, fed, pct, sc_count, unsc_count, vol, ext in st.session_state["source_candidates"]:
+                    source_stage[name] = stage
+
+            comparison_rows = []
+            conn_matches = 0
+            src_matches = 0
+            compared_count = 0
+            for sheet, manual_stage in manual_map.items():
+                conn = connectivity_stage.get(sheet, "?")
+                src = source_stage.get(sheet, "(not run)")
+                conn_match = (conn == manual_stage)
+                src_match = (src == manual_stage) if src != "(not run)" else None
+                if conn_match:
+                    conn_matches += 1
+                if src_match:
+                    src_matches += 1
+                if src != "(not run)":
+                    compared_count += 1
+                comparison_rows.append({
+                    "Sheet": sheet,
+                    "Manual": manual_stage,
+                    "Connectivity-Based": conn,
+                    "Connectivity Match": "Yes" if conn_match else "No",
+                    "Source Classification": src,
+                    "Source Match": ("Yes" if src_match else "No") if src_match is not None else "-",
+                })
+
+            if comparison_rows:
+                st.dataframe(comparison_rows, use_container_width=True)
+                total = len(comparison_rows)
+                conn_pct = round(conn_matches / total * 100, 1) if total else 0
+                shell_box(f"Connectivity-based classification matched manual for {conn_matches}/{total} sheets ({conn_pct}%)", ok=(conn_pct >= 70))
+                if compared_count:
+                    src_pct = round(src_matches / compared_count * 100, 1)
+                    shell_box(f"Source Classification matched manual for {src_matches}/{compared_count} sheets ({src_pct}%)", ok=(src_pct >= 70))
+                else:
+                    shell_box("Source Classification hasn't been run yet - run it above to include it in this comparison.", ok=True)
+            else:
+                shell_box("No sheets classified yet - drag at least one sheet into Input, Process, or Output above.", ok=False)
+    else:
+        st.caption("Run Health Check above first so sheet names are available to classify.")
+
+    def build_report_text():
+        BAR = "=" * 78
+        DASH = "-" * 78
+        lines = []
+
+        lines.append(BAR)
+        lines.append("EXCEL WORKBOOK HEALTH CHECK REPORT")
+        lines.append(BAR)
+        lines.append(f"Workbook:  {uploaded.name}")
+        lines.append(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"{r['formulas']} formulas across {r['sheets']} sheets")
+        lines.append("")
+
+        # --- Health Check section ---
+        lines.append(DASH)
+        lines.append("HEALTH CHECK")
+        lines.append(DASH)
+        lines.append("")
+
+        lines.append(f"Broken Links ({len(r['breaks'])})")
+        if r["breaks"]:
+            for s, c, f in r["breaks"]:
+                lines.append(f"  - {s}!{c} : {f}")
+        else:
+            lines.append("  None found.")
+        lines.append("")
+
+        lines.append(f"Circular References ({len(r['cycles'])})")
+        if r["cycles"]:
+            for cyc in r["cycles"]:
+                lines.append("  - " + " -> ".join(f"{s}!{c}" for s, c in cyc))
+        else:
+            lines.append("  None found.")
+        lines.append("")
+
+        lines.append(f"Isolated Sheets ({len(r['isolated'])})")
+        if r["isolated"]:
+            for s in r["isolated"]:
+                lines.append(f"  - {s}")
+        else:
+            lines.append("  None - every sheet is connected to the flow.")
+        lines.append("")
+
+        lines.append(f"Hidden Sheets ({len(r['hidden'])})")
+        if r["hidden"]:
+            for s, state in r["hidden"]:
+                lines.append(f"  - {s} ({state})")
+        else:
+            lines.append("  None found.")
+        lines.append("")
+
+        lines.append(f"External Data Connections ({len(r['connections'])})")
+        if r["connections"]:
+            for name, ctype, detail in r["connections"]:
+                lines.append(f"  - {name} ({ctype}): {detail}")
+        else:
+            lines.append("  None found.")
+        lines.append("")
+
+        # --- Source Classification section (only if it's been run) ---
+        if "source_candidates" in st.session_state:
+            sc = st.session_state["source_candidates"]
+            stage_counts = {"External Input": 0, "Input": 0, "Process": 0, "Output": 0, "Isolated": 0}
+            for _, stage, _, _, _, _, _, _ in sc:
+                stage_counts[stage] += 1
+
+            lines.append(DASH)
+            lines.append("SOURCE CLASSIFICATION")
+            lines.append(DASH)
+            lines.append("")
+            lines.append(
+                f"{len(sc)} sheet(s) total: {stage_counts['External Input']} External Input, "
+                f"{stage_counts['Input']} Input, {stage_counts['Process']} Process, "
+                f"{stage_counts['Output']} Output, {stage_counts['Isolated']} Isolated"
+            )
+            lines.append("")
+
+            col_widths = (22, 15, 9, 8, 10, 40)
+            header = ("Sheet", "Stage", "Struct%", "Volume", "Ext Refs", "Fed by")
+            lines.append("  ".join(h.ljust(w) for h, w in zip(header, col_widths)))
+            lines.append(DASH)
+            for name, stage, fed, pct, sc_count, unsc_count, vol, ext in sc:
+                fed_text = ", ".join(sorted(fed)) if fed else ""
+                row = (name, stage, f"{pct}%", str(vol), str(ext), fed_text)
+                lines.append("  ".join(str(v).ljust(w) for v, w in zip(row, col_widths)))
+            lines.append("")
+        else:
+            lines.append(DASH)
+            lines.append("SOURCE CLASSIFICATION")
+            lines.append(DASH)
+            lines.append("(Not run yet - use the Source Classification section above to include it here.)")
+            lines.append("")
+
+        lines.append(BAR)
+        lines.append("End of Report")
+        lines.append(BAR)
+        return "\n".join(lines)
+
+    st.download_button(
+        "Download Report (.txt)",
+        data=build_report_text(),
+        file_name="health_check_report.txt",
+        mime="text/plain",
+    )
+
+
+if __name__ == "__main__":
+    main()
