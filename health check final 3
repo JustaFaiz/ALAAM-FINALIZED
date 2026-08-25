@@ -1,0 +1,1501 @@
+"""
+health_check.py
+-----------------
+Streamlit dashboard: drag in an Excel workbook, run a health check
+(broken links, circular references, isolated sheets, hidden sheets,
+external data connections), see a scorecard + detail tables, and
+launch the interactive sheet-flow tree visual with one click.
+
+Requires:
+    pip install streamlit openpyxl
+    (pywin32 too, only needed by sheet_tree_server.py for the tree's
+    click-to-open-in-Excel feature - not needed by this dashboard itself)
+
+Usage:
+    streamlit run health_check.py
+
+Sheet_Trace_Visual_6.py should be saved in the SAME FOLDER as this file
+so the "Open Sheet Flow Visual" button can find and launch it.
+"""
+
+import concurrent.futures
+import datetime
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import webbrowser
+import sys
+import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
+
+import streamlit as st
+from streamlit_sortables import sort_items
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+# ---------------------------------------------------------------
+# Formula parsing (same approach as trace_precedents.py / sheet_tree_server.py)
+# ---------------------------------------------------------------
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+
+FULL_RANGE_ROW_CAP = 5000
+FULL_RANGE_COL_CAP = 200
+
+
+def _spans_overlap(span, other_spans):
+    s0, s1 = span
+    for a0, a1 in other_spans:
+        if s0 < a1 and a0 < s1:
+            return True
+    return False
+
+
+def extract_refs(formula, current_sheet, sheet_bounds):
+    """Returns list of (sheet, cell, is_range). For any range (proper
+    range, full column, or full row), only the first and last cell are
+    returned - not every cell in between."""
+    refs = []
+    matched_spans = []
+
+    for m in CELL_REF_RE.finditer(formula):
+        matched_spans.append(m.span())
+        sheet = m.group(1) or m.group(2) or current_sheet
+        cell1 = m.group(3).replace('$', '')
+        cell2 = m.group(4)
+        if cell2:
+            cell2 = cell2.replace('$', '')
+            refs.append((sheet, cell1, True))
+            refs.append((sheet, cell2, True))
+        else:
+            refs.append((sheet, cell1, False))
+
+    for m in COLUMN_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        col1, col2 = m.group(3), m.group(4)
+        c1, c2 = column_index_from_string(col1), column_index_from_string(col2)
+        if c1 > c2:
+            c1, c2 = c2, c1
+        max_row = min(sheet_bounds.get(sheet, (FULL_RANGE_ROW_CAP, 1))[0], FULL_RANGE_ROW_CAP) or 1
+        refs.append((sheet, f"{get_column_letter(c1)}1", True))
+        refs.append((sheet, f"{get_column_letter(c2)}{max_row}", True))
+
+    for m in ROW_ONLY_RE.finditer(formula):
+        if _spans_overlap(m.span(), matched_spans):
+            continue
+        sheet = m.group(1) or m.group(2) or current_sheet
+        row1, row2 = int(m.group(3)), int(m.group(4))
+        if row1 > row2:
+            row1, row2 = row2, row1
+        max_col = min(sheet_bounds.get(sheet, (1, FULL_RANGE_COL_CAP))[1], FULL_RANGE_COL_CAP) or 1
+        refs.append((sheet, f"A{row1}", True))
+        refs.append((sheet, f"{get_column_letter(max_col)}{row2}", True))
+
+    return refs
+
+
+def load_workbook_data(path):
+    """Returns (formulas, sheet_names, hidden_sheets, sheet_bounds).
+    Only reads formulas - no longer loads cell VALUES at all, since
+    blank-cell content isn't checked anymore (per manager's guidance,
+    a reference to an intentionally-blank cell isn't a "broken link" -
+    only a reference to a genuinely invalid cell/sheet is). This also
+    means only ONE pass over the workbook is needed now, not two."""
+    wb_f = load_workbook(path, data_only=False, read_only=True)
+    formulas, sheet_bounds = {}, {}
+    hidden_sheets = []
+    for ws in wb_f.worksheets:
+        max_row = ws.max_row or 1
+        max_col = ws.max_column or 1
+        sheet_bounds[ws.title] = (max_row, max_col)
+        if ws.sheet_state != "visible":
+            hidden_sheets.append((ws.title, ws.sheet_state))
+
+        rows_f = ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)
+        for r_idx, row in enumerate(rows_f, start=1):
+            for c_idx, cell in enumerate(row, start=1):
+                if isinstance(cell.value, str) and cell.value.startswith('='):
+                    coord = f"{get_column_letter(c_idx)}{r_idx}"
+                    formulas[(ws.title, coord)] = cell.value
+    wb_f.close()
+    return formulas, wb_f.sheetnames, hidden_sheets, sheet_bounds
+
+
+def analyze_formulas(formulas, sheet_bounds):
+    """Parses every formula's references ONCE and derives both precedents
+    (for broken-link/cycle checks) and flow (for isolated-sheet check + sheet
+    diagram) from that same pass - previously these were computed by two
+    separate functions that each re-ran the same regex parsing."""
+    precedents = {}
+    flow = {}
+    for key, f in formulas.items():
+        sheet = key[0]
+        refs = extract_refs(f, sheet, sheet_bounds)
+        precedents[key] = refs
+        source_sheets = set(s for s, c, is_range in refs if s != sheet)
+        for src in source_sheets:
+            flow[(src, sheet)] = flow.get((src, sheet), 0) + 1
+    return precedents, flow
+
+
+# ---------------------------------------------------------------
+# Health checks
+# ---------------------------------------------------------------
+
+def check_broken_links(formulas):
+    """Flags formulas that literally contain Excel's own #REF! error
+    marker - this is what Excel writes into a formula's text when a
+    referenced cell/row/column/sheet has been deleted, making the
+    reference genuinely invalid. This is the only fully reliable signal
+    of a real broken link: every other cell address is technically
+    valid in Excel whether it currently holds data or not, so range or
+    blank-cell heuristics produce false positives on ordinary formulas
+    referencing not-yet-filled-in cells. Per manager's guidance, those
+    are not flagged - only genuine #REF! breaks are."""
+    breaks = []
+    for (sheet, cell), f in formulas.items():
+        if "#REF!" in f.upper():
+            breaks.append((sheet, cell, f))
+    return breaks
+
+
+def check_circular_refs(precedents):
+    """DFS-based cycle detection over direct single-cell references
+    (ranges excluded, since expanding them for cycle-checking would be
+    expensive and true range-based circularity is rare). Returns a list
+    of cycles found, each as a list of (sheet, cell) forming the loop."""
+    graph = {}
+    for key, refs in precedents.items():
+        graph[key] = [(s, c) for s, c, is_range in refs if not is_range]
+
+    GRAY, BLACK = 1, 2
+    color = {}
+    cycles = []
+
+    def dfs(start):
+        stack = [(start, iter(graph.get(start, [])))]
+        path = [start]
+        color[start] = GRAY
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for nxt in it:
+                advanced = True
+                if nxt not in color:
+                    color[nxt] = GRAY
+                    path.append(nxt)
+                    stack.append((nxt, iter(graph.get(nxt, []))))
+                    break
+                elif color[nxt] == GRAY:
+                    idx = path.index(nxt)
+                    cycles.append(path[idx:] + [nxt])
+                break
+            if not advanced:
+                color[node] = BLACK
+                stack.pop()
+                path.pop()
+
+    for node in list(graph.keys()):
+        if node not in color:
+            dfs(node)
+
+    return cycles[:20]  # cap - a workbook with many cycles doesn't need all listed
+
+
+VALIDATED_STAGE_COLORS = {
+    "Input": "#2ecc71",
+    "Process": "#2a9d8f",
+    "Output": "#f39c12",
+    "Isolated": "#7f8c8d",
+}
+UNVALIDATED_COLOR = "#3a3a3a"  # muted gray - not confirmed by both methods
+
+VALIDATED_TREE_HTML_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body {
+    margin:0; padding:0; background:#111111;
+    height:100%;
+  }
+  body {
+    display:flex;
+    flex-direction:column;
+    height:100vh;
+  }
+  #legend {
+    flex:0 0 auto;
+    font-family:sans-serif; font-size:12px; color:white; padding:8px 12px;
+    background:#1a1a1a;
+  }
+  #tree {
+    flex:1 1 auto;
+    min-height:0;
+    width:100%;
+  }
+  .swatch { display:inline-block; width:12px; height:12px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+</style>
+</head>
+<body>
+<div id="legend">
+  <span class="swatch" style="background:#2ecc71;"></span>Input&nbsp;&nbsp;
+  <span class="swatch" style="background:#2a9d8f;"></span>Process&nbsp;&nbsp;
+  <span class="swatch" style="background:#f39c12;"></span>Output&nbsp;&nbsp;
+  <span class="swatch" style="background:#7f8c8d;"></span>Isolated&nbsp;&nbsp;
+  <span class="swatch" style="background:#3a3a3a;"></span>Not classified&nbsp;&nbsp;
+  <span style="color:#cccccc;">(solid border = confirmed &middot; dashed border = unclassified)</span>
+  <span id="fullscreenBtn" style="float:right; cursor:pointer; text-decoration:underline;">Fullscreen</span>
+</div>
+<div id="tree"></div>
+<script type="text/javascript">
+  document.getElementById('fullscreenBtn').addEventListener('click', function() {
+    var elem = document.documentElement;
+    var request = elem.requestFullscreen || elem.webkitRequestFullscreen || elem.msRequestFullscreen;
+    if (request) {
+      request.call(elem).catch(function() {
+        alert("Fullscreen isn't available in this view - try 'Open Visual in New Tab' below instead, or press F11.");
+      });
+    } else {
+      alert("Fullscreen isn't supported here - try 'Open Visual in New Tab' below instead, or press F11.");
+    }
+  });
+
+  var nodes = new vis.DataSet(__NODES__);
+  var edges = new vis.DataSet(__EDGES__);
+  var container = document.getElementById('tree');
+  var data = { nodes: nodes, edges: edges };
+  var options = {
+    layout: {
+      hierarchical: {
+        enabled: true, direction: "LR", sortMethod: "directed",
+        levelSeparation: 200, nodeSpacing: 130, treeSpacing: 160
+      }
+    },
+    physics: {
+      hierarchicalRepulsion: { nodeDistance: 150 },
+      solver: "hierarchicalRepulsion"
+    },
+    edges: {
+      smooth: { type: "cubicBezier", forceDirection: "horizontal" },
+      arrows: { to: { enabled: true } },
+      color: "#888888",
+      font: { color: "#ffffff" }
+    },
+    nodes: { font: { color: "#ffffff", size: 13 } }
+  };
+  var network = new vis.Network(container, data, options);
+  network.once("stabilizationIterationsDone", function () {
+    network.setOptions({ physics: false });
+  });
+  window.addEventListener('resize', function() {
+    network.redraw();
+  });
+</script>
+</body>
+</html>
+"""
+
+
+def build_manual_stage_tree_html(flow, manual_stages, sheet_names, min_cells=1):
+    """Builds the sheet-flow tree colored by your CONFIRMED manual
+    classification - your own domain judgment on Input/Process/Output
+    for each sheet, treated as ground truth. Flow EDGES are still the
+    real, actual formula references between sheets, same as the regular
+    tree visual. Confirmed sheets render with a solid white border and
+    bold label so the ground truth reads as solid/certain at a glance.
+    Sheets never classified (shouldn't normally reach here since this
+    is only called post-confirmation, but kept as a safety net) render
+    muted with a dashed border to visually mark them as not confirmed."""
+    strong_flow = {k: v for k, v in flow.items() if v >= min_cells}
+
+    all_sheets = set(sheet_names)
+    for src, dst in strong_flow:
+        all_sheets.add(src)
+        all_sheets.add(dst)
+
+    nodes = []
+    for sheet in all_sheets:
+        if sheet in manual_stages:
+            stage = manual_stages[sheet]
+            color = VALIDATED_STAGE_COLORS.get(stage, UNVALIDATED_COLOR)
+            title = f"{sheet}\\nStage: {stage} (confirmed)"
+            nodes.append({
+                "id": sheet,
+                "label": sheet,
+                "shape": "box",
+                "title": title,
+                "color": {
+                    "background": color,
+                    "border": "#ffffff",
+                    "highlight": {"background": color, "border": "#ffffff"},
+                },
+                "borderWidth": 3,
+                "font": {"color": "#ffffff", "bold": True},
+            })
+        else:
+            title = f"{sheet}\\nNot classified"
+            nodes.append({
+                "id": sheet,
+                "label": sheet,
+                "shape": "box",
+                "title": title,
+                "color": {"background": UNVALIDATED_COLOR, "border": "#666666"},
+                "borderWidth": 1,
+                "shapeProperties": {"borderDashes": [4, 3]},
+            })
+
+    edges = []
+    for (src, dst), count in strong_flow.items():
+        edges.append({"from": src, "to": dst, "label": str(count), "title": f"{count} formula cells"})
+
+    return VALIDATED_TREE_HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
+
+
+STAGED_FLOW_HTML_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body {
+    margin:0; padding:0; background:#111111;
+    height:100%;
+  }
+  body {
+    display:flex;
+    flex-direction:column;
+    height:100vh;
+  }
+  #legend {
+    flex:0 0 auto;
+    font-family:sans-serif; font-size:12px; color:white; padding:8px 12px;
+    background:#1a1a1a;
+  }
+  #tree {
+    flex:1 1 auto;
+    min-height:0;
+    width:100%;
+  }
+  .swatch { display:inline-block; width:12px; height:12px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+</style>
+</head>
+<body>
+<div id="legend">
+  <span class="swatch" style="background:#2ecc71;"></span>Input (confirmed)&nbsp;&nbsp;
+  <span class="swatch" style="background:#2a9d8f;"></span>Process (confirmed)&nbsp;&nbsp;
+  <span class="swatch" style="background:#f39c12;"></span>Output (confirmed)&nbsp;&nbsp;
+  <span class="swatch" style="background:#8e6bbf;"></span>Pass-through (unclassified, on the path)&nbsp;&nbsp;
+  <span id="fullscreenBtn" style="float:right; cursor:pointer; text-decoration:underline;">Fullscreen</span>
+</div>
+<div id="tree"></div>
+<script type="text/javascript">
+  document.getElementById('fullscreenBtn').addEventListener('click', function() {
+    var elem = document.documentElement;
+    var request = elem.requestFullscreen || elem.webkitRequestFullscreen || elem.msRequestFullscreen;
+    if (request) {
+      request.call(elem).catch(function() {
+        alert("Fullscreen isn't available in this view - try 'Open Visual in New Tab' below instead, or press F11.");
+      });
+    } else {
+      alert("Fullscreen isn't supported here - try 'Open Visual in New Tab' below instead, or press F11.");
+    }
+  });
+
+  var nodes = new vis.DataSet(__NODES__);
+  var edges = new vis.DataSet(__EDGES__);
+  var container = document.getElementById('tree');
+  var data = { nodes: nodes, edges: edges };
+  var options = {
+    layout: {
+      hierarchical: {
+        enabled: true, direction: "LR", sortMethod: "directed",
+        levelSeparation: 220, nodeSpacing: 130, treeSpacing: 160
+      }
+    },
+    physics: {
+      hierarchicalRepulsion: { nodeDistance: 150 },
+      solver: "hierarchicalRepulsion"
+    },
+    edges: {
+      smooth: { type: "cubicBezier", forceDirection: "horizontal" },
+      arrows: { to: { enabled: true } },
+      color: "#888888",
+      font: { color: "#ffffff" }
+    },
+    nodes: { font: { color: "#ffffff", size: 13 } }
+  };
+  var network = new vis.Network(container, data, options);
+  network.once("stabilizationIterationsDone", function () {
+    network.setOptions({ physics: false });
+  });
+  window.addEventListener('resize', function() {
+    network.redraw();
+  });
+</script>
+</body>
+</html>
+"""
+
+NO_PATH_HTML_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {
+    margin:0; padding:0; background:#111111; height:100%;
+    display:flex; align-items:center; justify-content:center;
+    font-family:sans-serif;
+  }
+  .msg {
+    color:#eeeeee; max-width:600px; padding:30px; text-align:center;
+    background:#1a1a1a; border-radius:8px; border:1px solid #444444;
+  }
+  .msg h2 { color:#f39c12; margin-top:0; }
+</style>
+</head>
+<body>
+  <div class="msg">
+    <h2>No complete Input &rarr; Output path found</h2>
+    <p>__MESSAGE__</p>
+  </div>
+</body>
+</html>
+"""
+
+
+def build_staged_flow_html(flow, manual_stages, sheet_names):
+    """Builds the LOCKED Input -> Process -> Output flow map: columns are
+    fixed by your CONFIRMED classification (not re-derived from the graph),
+    and the only edges drawn are ones that lie on an actual formula-flow
+    path from a confirmed Input sheet to a confirmed Output sheet - traced
+    hop by hop through real sheet-to-sheet formula references, same data
+    as the rest of the dashboard (r['flow']), not a fresh guess.
+
+    Sheets in between that were never manually classified can still appear
+    if a real formula path runs through them on its way to an Output - they
+    show up as muted "pass-through" nodes so the path stays intact and
+    honest, without pretending they were classified.
+
+    Any Input or Process or Output sheet that doesn't actually connect to
+    an Output (or wasn't reached by any Input) is deliberately left out of
+    this diagram - it isn't part of the input-to-output story, even though
+    it's part of the confirmed classification. That's a genuinely different
+    question than "how does data flow start to finish."
+    """
+    input_sheets = {s for s, stage in manual_stages.items() if stage == "Input"}
+    output_sheets = {s for s, stage in manual_stages.items() if stage == "Output"}
+
+    if not input_sheets or not output_sheets:
+        return None, "The confirmed classification doesn't include at least one Input sheet and one Output sheet, so there's nothing to trace a path between."
+
+    # Forward adjacency (src -> [dst, ...]) built once from the real flow data.
+    forward = {}
+    for (src, dst), count in flow.items():
+        forward.setdefault(src, []).append((dst, count))
+
+    # Reverse adjacency (dst -> [src, ...]) for the backward reachability pass.
+    reverse = {}
+    for (src, dst), count in flow.items():
+        reverse.setdefault(dst, []).append((src, count))
+
+    # Every sheet reachable FORWARD from any confirmed Input sheet.
+    forward_reachable = set()
+    queue = list(input_sheets)
+    forward_reachable.update(input_sheets)
+    while queue:
+        node = queue.pop()
+        for dst, _ in forward.get(node, []):
+            if dst not in forward_reachable:
+                forward_reachable.add(dst)
+                queue.append(dst)
+
+    # Every sheet that can reach BACKWARD to any confirmed Output sheet.
+    backward_reachable = set()
+    queue = list(output_sheets)
+    backward_reachable.update(output_sheets)
+    while queue:
+        node = queue.pop()
+        for src, _ in reverse.get(node, []):
+            if src not in backward_reachable:
+                backward_reachable.add(src)
+                queue.append(src)
+
+    # The corridor: sheets that are BOTH downstream of an Input AND
+    # upstream of an Output - i.e. genuinely on some Input -> Output path.
+    corridor = forward_reachable & backward_reachable
+
+    if not corridor or not (corridor & input_sheets) or not (corridor & output_sheets):
+        return None, "None of the confirmed Input sheets have a formula path that actually reaches a confirmed Output sheet yet, based on the current formulas."
+
+    # BFS distance from the nearest Input sheet, restricted to the corridor,
+    # used purely to position columns left-to-right in the visual.
+    level = {s: 0 for s in corridor & input_sheets}
+    queue = list(level.keys())
+    while queue:
+        node = queue.pop(0)
+        for dst, _ in forward.get(node, []):
+            if dst in corridor and dst not in level:
+                level[dst] = level[node] + 1
+                queue.append(dst)
+    # Safety net: any corridor node BFS didn't reach directly from an Input
+    # (shouldn't normally happen given forward_reachable) gets pushed to the end.
+    max_level = max(level.values(), default=0)
+    for s in corridor:
+        if s not in level:
+            max_level += 1
+            level[s] = max_level
+
+    nodes = []
+    for sheet in corridor:
+        stage = manual_stages.get(sheet)
+        if stage == "Input":
+            color, border, width, bold = "#2ecc71", "#ffffff", 3, True
+            title = f"{sheet}\\nInput (confirmed)"
+        elif stage == "Process":
+            color, border, width, bold = "#2a9d8f", "#ffffff", 3, True
+            title = f"{sheet}\\nProcess (confirmed)"
+        elif stage == "Output":
+            color, border, width, bold = "#f39c12", "#ffffff", 3, True
+            title = f"{sheet}\\nOutput (confirmed)"
+        else:
+            color, border, width, bold = "#8e6bbf", "#555555", 1, False
+            title = f"{sheet}\\nPass-through (not classified)"
+        nodes.append({
+            "id": sheet,
+            "label": sheet,
+            "shape": "box",
+            "level": level[sheet],
+            "title": title,
+            "color": {"background": color, "border": border},
+            "borderWidth": width,
+            "font": {"color": "#ffffff", "bold": bold},
+        })
+
+    edges = []
+    for (src, dst), count in flow.items():
+        if src in corridor and dst in corridor:
+            edges.append({"from": src, "to": dst, "label": str(count), "title": f"{count} formula cells"})
+
+    html = STAGED_FLOW_HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
+    return html, None
+
+
+def derive_connectivity_stage(sheet_names, flow):
+    """Classifies each sheet by CONNECTIVITY ALONE (same signal the tree
+    visual uses for root/leaf/middle coloring) - completely independent
+    of the structured-%-based Source Classification:
+    - Input:    feeds other sheets, nothing feeds it
+    - Process:  both receives from and feeds into other sheets
+    - Output:   receives from other sheets, feeds nothing further
+    - Isolated: no cross-sheet connections at all
+    Returns a dict: sheet_name -> stage."""
+    has_incoming = set()
+    has_outgoing = set()
+    for src, dst in flow:
+        has_outgoing.add(src)
+        has_incoming.add(dst)
+
+    stages = {}
+    for sheet in sheet_names:
+        incoming = sheet in has_incoming
+        outgoing = sheet in has_outgoing
+        if incoming and outgoing:
+            stages[sheet] = "Process"
+        elif outgoing and not incoming:
+            stages[sheet] = "Input"
+        elif incoming and not outgoing:
+            stages[sheet] = "Output"
+        else:
+            stages[sheet] = "Isolated"
+    return stages
+
+
+def check_isolated_sheets(sheet_names, flow):
+    connected = set()
+    for src, dst in flow:
+        connected.add(src)
+        connected.add(dst)
+    return [s for s in sheet_names if s not in connected]
+
+
+def check_pdf(path):
+    """Lightweight PDF health check - not trying to apply Excel-style
+    concepts (broken formulas etc don't exist for PDFs). Just: is it
+    actually readable, how many pages, and does it have a real text
+    layer at all - a scanned image with no extractable text matters a
+    lot for anything downstream trying to process it automatically."""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(path)
+        num_pages = len(reader.pages)
+        has_text = False
+        for page in reader.pages[:5]:  # sample first 5 pages, not every page - just need a signal
+            if (page.extract_text() or "").strip():
+                has_text = True
+                break
+        encrypted = reader.is_encrypted
+        return {"readable": True, "pages": num_pages, "has_text": has_text,
+                "encrypted": encrypted, "error": ""}
+    except Exception as e:
+        return {"readable": False, "pages": 0, "has_text": False,
+                "encrypted": False, "error": str(e)}
+
+
+def _file_fingerprint(path):
+    """(mtime, size) for a file - passed into the cached scan functions
+    below as part of the cache key, so a file that hasn't changed since
+    the last scan returns instantly from cache, and a file that HAS
+    changed (different mtime/size) is correctly treated as a cache miss
+    and re-scanned. Purely a cache-invalidation signal, not used for
+    anything else."""
+    stat = os.stat(path)
+    return (stat.st_mtime, stat.st_size)
+
+
+@st.cache_data(show_spinner=False)
+def scan_one_excel_cached(path, fingerprint):
+    """Runs the same checks as the single-file flow for one workbook and
+    returns a single summary row. Cached on (path, fingerprint) - a
+    repeat Scan Folder on an unchanged file returns instantly instead of
+    re-parsing. Wrapped in try/except since a batch scan shouldn't abort
+    on one bad file; failures show up as an ERROR row instead."""
+    fname = os.path.basename(path)
+    try:
+        formulas, sheet_names, hidden_sheets, sheet_bounds = load_workbook_data(path)
+        precedents, flow = analyze_formulas(formulas, sheet_bounds)
+        breaks = check_broken_links(formulas)
+        cycles = check_circular_refs(precedents)
+        isolated = check_isolated_sheets(sheet_names, flow)
+        connections = check_external_connections(path)
+        return {
+            "File": fname, "Sheets": len(sheet_names), "Formulas": len(formulas),
+            "Broken Links": len(breaks), "Circular Refs": len(cycles),
+            "Isolated Sheets": len(isolated), "Hidden Sheets": len(hidden_sheets),
+            "External Connections": len(connections),
+        }
+    except Exception as e:
+        return {"File": fname, "Sheets": "ERROR", "Formulas": str(e)[:60],
+                "Broken Links": "-", "Circular Refs": "-",
+                "Isolated Sheets": "-", "Hidden Sheets": "-",
+                "External Connections": "-"}
+
+
+@st.cache_data(show_spinner=False)
+def scan_one_pdf_cached(path, fingerprint):
+    """Same caching approach as scan_one_excel_cached, for the lighter
+    PDF readability check."""
+    fname = os.path.basename(path)
+    result = check_pdf(path)
+    return {
+        "File": fname, "Readable": "Yes" if result["readable"] else "No",
+        "Pages": result["pages"], "Has Text Layer": "Yes" if result["has_text"] else "No",
+        "Encrypted": "Yes" if result["encrypted"] else "No",
+        "Error": result["error"][:60],
+    }
+
+
+def check_external_connections(path):
+    """Reads xl/connections.xml directly from the xlsx zip - this is
+    where Excel stores Power Query / ODBC / SQL / web data connections.
+    Not visible to formula parsing since it's workbook metadata, not a
+    cell formula."""
+    connections = []
+    try:
+        with zipfile.ZipFile(path) as z:
+            if "xl/connections.xml" not in z.namelist():
+                return connections
+            with z.open("xl/connections.xml") as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+                ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+                for conn in root.findall(".//m:connection", ns):
+                    name = conn.get("name", "(unnamed)")
+                    conn_type = conn.get("type", "")
+                    db_pr = conn.find("m:dbPr", ns)
+                    detail = db_pr.get("connection") if db_pr is not None else ""
+                    connections.append((name, conn_type, detail or ""))
+    except Exception:
+        pass
+    return connections
+
+
+# ---------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------
+
+SHELL_YELLOW = "#FBCE07"
+SHELL_RED = "#DD1D21"
+SHELL_DARK = "#1A1A1A"
+
+
+def apply_shell_theme():
+    st.markdown(
+        f"""
+        <style>
+        .stButton>button {{
+            background-color: {SHELL_RED};
+            color: white;
+            border: 2px solid {SHELL_YELLOW};
+            font-weight: bold;
+        }}
+        .stButton>button:hover {{
+            background-color: {SHELL_YELLOW};
+            color: {SHELL_DARK};
+            border: 2px solid {SHELL_RED};
+        }}
+        .shell-banner {{
+            background-color: {SHELL_RED};
+            color: white;
+            padding: 14px 20px;
+            border-radius: 6px;
+            border-left: 10px solid {SHELL_YELLOW};
+            font-size: 28px;
+            font-weight: bold;
+            margin-bottom: 20px;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def shell_box(text, ok):
+    """Status box: yellow = OK, red = issue found. No default
+    Streamlit green anywhere - just the two Shell brand colors."""
+    bg = SHELL_YELLOW if ok else SHELL_RED
+    fg = SHELL_DARK if ok else "white"
+    st.markdown(
+        f'<div style="background-color:{bg}; color:{fg}; padding:10px 14px; '
+        f'border-radius:6px; font-weight:bold; margin-bottom:8px;">{text}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def write_temp_file(tmp_dir, filename, data_bytes):
+    """Writes data_bytes to tmp_dir/filename - but ONLY if that exact
+    path doesn't already hold identical content. Streamlit reruns the
+    whole script on every widget interaction (including each drag in
+    Manual Classification), so without this check the app would try to
+    rewrite the same unchanged workbook dozens of times per session.
+
+    If a write IS actually needed and the target path turns out to be
+    locked - most commonly because you have the SAME file open in Excel
+    to refer to it while working in the dashboard, which is a completely
+    reasonable thing to want to do - this falls back to a content-hashed
+    filename instead of raising. The fallback name is deterministic
+    (same bytes -> same fallback path), so an unchanged file stays on
+    the same fallback path across reruns too, and the "skip if already
+    identical" check above still applies to it on the next rerun.
+
+    Returns the path actually holding the content, for the caller to
+    read from downstream."""
+    target = os.path.join(tmp_dir, filename)
+    digest = hashlib.md5(data_bytes).hexdigest()[:10]
+
+    def _matches(path):
+        try:
+            with open(path, "rb") as f:
+                return f.read() == data_bytes
+        except (PermissionError, OSError):
+            return False  # can't even read it back right now - don't trust it
+
+    if os.path.exists(target) and _matches(target):
+        return target  # already there, unchanged - nothing to do
+
+    try:
+        with open(target, "wb") as f:
+            f.write(data_bytes)
+        return target
+    except (PermissionError, OSError):
+        stem, ext = os.path.splitext(filename)
+        fallback = os.path.join(tmp_dir, f"{stem}_{digest}{ext}")
+        if os.path.exists(fallback) and _matches(fallback):
+            return fallback
+        with open(fallback, "wb") as f:
+            f.write(data_bytes)
+        return fallback
+
+
+def main():
+    st.set_page_config(page_title="Workbook Health Check", layout="wide")
+    apply_shell_theme()
+    st.markdown('<div class="shell-banner">Excel Workbook Health Check</div>', unsafe_allow_html=True)
+
+    # -----------------------------------------------------------
+    # Batch Folder Scan - runs independently of the single-file
+    # upload flow below. Since this app runs locally on the same
+    # machine as the files, a folder PATH works directly - no upload
+    # needed. Scans every .xlsx/.xlsm with the same checks as the
+    # single-file flow, and every .pdf with a lighter readability check.
+    # This is a quick top-level triage pass, separate from the deeper
+    # per-workbook analysis (Source Classification, Manual Classification,
+    # flow maps) below, which still operates on one uploaded file at a time.
+    # -----------------------------------------------------------
+    st.subheader("Batch Folder Scan")
+    folder_path = st.text_input("Folder path (scans .xlsx, .xlsm, and .pdf files - top-level only, not subfolders)")
+
+    if st.button("Scan Folder"):
+        if not folder_path or not os.path.isdir(folder_path):
+            shell_box(f"'{folder_path}' isn't a valid folder path.", ok=False)
+        else:
+            entries = sorted(os.listdir(folder_path))
+            excel_files = [e for e in entries if e.lower().endswith((".xlsx", ".xlsm"))]
+            pdf_files = [e for e in entries if e.lower().endswith(".pdf")]
+
+            # Scanned in parallel across files - each file is fully
+            # independent work (open, parse, check), so this is a good
+            # fit for a thread pool even though Python has a GIL: most
+            # of the time per file goes into disk I/O and XML parsing
+            # (openpyxl/zipfile), both of which release the GIL, so
+            # threads give a real speedup here without the process-pool
+            # pickling/spawn complications that tend to bite inside
+            # Streamlit's script-rerun execution model.
+            # Results are also cached per-file (see scan_one_excel_cached/
+            # scan_one_pdf_cached above) on (path, mtime, size) - so a
+            # repeat scan of a folder where files haven't changed comes
+            # back almost instantly, parallel or not.
+            excel_paths = [os.path.join(folder_path, f) for f in excel_files]
+            pdf_paths = [os.path.join(folder_path, f) for f in pdf_files]
+            max_workers = min(8, max(1, len(excel_paths) + len(pdf_paths)))
+
+            excel_rows = []
+            pdf_rows = []
+            total_files = len(excel_paths) + len(pdf_paths)
+
+            if total_files:
+                progress = st.progress(0.0, text=f"Scanning 0/{total_files} file(s)...")
+                done = 0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    future_to_kind = {}
+                    for p in excel_paths:
+                        fut = pool.submit(scan_one_excel_cached, p, _file_fingerprint(p))
+                        future_to_kind[fut] = ("excel", p)
+                    for p in pdf_paths:
+                        fut = pool.submit(scan_one_pdf_cached, p, _file_fingerprint(p))
+                        future_to_kind[fut] = ("pdf", p)
+
+                    results_by_path = {}
+                    for fut in concurrent.futures.as_completed(future_to_kind):
+                        kind, p = future_to_kind[fut]
+                        results_by_path[p] = (kind, fut.result())
+                        done += 1
+                        progress.progress(done / total_files, text=f"Scanning {done}/{total_files} file(s)...")
+
+                progress.empty()
+                # Rebuild in original alphabetical order (as_completed finishes
+                # out of order) so the tables below display consistently.
+                excel_rows = [results_by_path[p][1] for p in excel_paths]
+                pdf_rows = [results_by_path[p][1] for p in pdf_paths]
+
+            if not excel_files and not pdf_files:
+                shell_box("No .xlsx, .xlsm, or .pdf files found in that folder.", ok=False)
+
+            if excel_rows:
+                st.write(f"**Excel files ({len(excel_rows)})**")
+                st.dataframe(excel_rows, use_container_width=True)
+            if pdf_rows:
+                st.write(f"**PDF files ({len(pdf_rows)})**")
+                st.dataframe(pdf_rows, use_container_width=True)
+
+    st.divider()
+
+    uploaded = st.file_uploader("Drop your .xlsx or .xlsm workbook here", type=["xlsx", "xlsm"])
+    if uploaded is None:
+        shell_box("Upload a workbook to run the health check.", ok=True)
+        return
+
+    tmp_dir = tempfile.gettempdir()
+    file_bytes = uploaded.getbuffer().tobytes()
+    tmp_path = write_temp_file(tmp_dir, uploaded.name, file_bytes)
+
+    shell_box(f"Loaded: {uploaded.name}", ok=True)
+
+    @st.cache_data(show_spinner=False)
+    def run_analysis(file_bytes, filename, path):
+        """Cached on file_bytes+filename - re-uploading or re-clicking
+        Run on the SAME unchanged file returns instantly instead of
+        re-parsing from scratch."""
+        formulas, sheet_names, hidden_sheets, sheet_bounds = load_workbook_data(path)
+        precedents, flow = analyze_formulas(formulas, sheet_bounds)
+        breaks = check_broken_links(formulas)
+        cycles = check_circular_refs(precedents)
+        isolated = check_isolated_sheets(sheet_names, flow)
+        connections = check_external_connections(path)
+        connectivity_stage = derive_connectivity_stage(sheet_names, flow)
+        return {
+            "formulas": len(formulas), "sheets": len(sheet_names),
+            "sheet_names": sheet_names,
+            "breaks": breaks, "cycles": cycles, "isolated": isolated,
+            "connections": connections, "hidden": hidden_sheets,
+            "connectivity_stage": connectivity_stage,
+            "flow": flow,
+        }
+
+    if st.button("Run Health Check", type="primary"):
+        with st.spinner("Analyzing workbook..."):
+            st.session_state["results"] = run_analysis(file_bytes, uploaded.name, tmp_path)
+            # New workbook analyzed - any previously confirmed classification
+            # belonged to the old sheet set, so it must be cleared to avoid
+            # showing stale ground truth against a different workbook.
+            st.session_state.pop("manual_confirmed", None)
+            st.session_state.pop("manual_confirmed_stages", None)
+            st.session_state.pop("manual_unclassified_count", None)
+            st.session_state.pop("manual_classification_state", None)
+            for _stage in ("Input", "Process", "Output"):
+                st.session_state.pop(f"manual_stage_multiselect_{_stage}", None)
+
+    if "results" not in st.session_state:
+        return
+
+    r = st.session_state["results"]
+    st.caption(f"{r['formulas']} formulas across {r['sheets']} sheets")
+
+    def badge(count, label):
+        shell_box(f"{label}: {count} found" if count else f"{label}: none found", ok=(count == 0))
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        badge(len(r["breaks"]), "Broken links")
+    with col2:
+        badge(len(r["cycles"]), "Circular refs")
+    with col3:
+        badge(len(r["isolated"]), "Isolated sheets")
+    with col4:
+        badge(len(r["hidden"]), "Hidden sheets")
+    with col5:
+        badge(len(r["connections"]), "External connections")
+
+    with st.expander(f"Broken links ({len(r['breaks'])})"):
+        if r["breaks"]:
+            st.write("Formulas containing Excel's own #REF! error marker (a reference that was deleted/invalidated):")
+            st.dataframe(
+                [{"Sheet": s, "Cell": c, "Formula": f} for s, c, f in r["breaks"]],
+                use_container_width=True,
+            )
+        else:
+            st.write("No #REF! errors found - no genuinely broken references.")
+
+    with st.expander(f"Circular references ({len(r['cycles'])})"):
+        if r["cycles"]:
+            for cyc in r["cycles"]:
+                st.code(" -> ".join(f"{s}!{c}" for s, c in cyc))
+        else:
+            st.write("No circular references detected.")
+
+    with st.expander(f"Isolated sheets ({len(r['isolated'])})"):
+        if r["isolated"]:
+            st.write("These sheets have no cross-sheet formula connections at all (nothing feeds them, they feed nothing):")
+            st.dataframe([{"Sheet": s} for s in r["isolated"]], use_container_width=True)
+        else:
+            st.write("Every sheet is connected to the flow.")
+
+    with st.expander(f"Hidden sheets ({len(r['hidden'])})"):
+        if r["hidden"]:
+            st.dataframe([{"Sheet": s, "State": state} for s, state in r["hidden"]], use_container_width=True)
+        else:
+            st.write("No hidden sheets.")
+
+    with st.expander(f"External data connections ({len(r['connections'])})"):
+        if r["connections"]:
+            st.write("These are the workbook's OWN entry points into outside data - the piece formula-tracing can't see past:")
+            st.dataframe(
+                [{"Name": n, "Type": t, "Connection detail": d} for n, t, d in r["connections"]],
+                use_container_width=True,
+            )
+        else:
+            st.write("No Power Query / ODBC / SQL / external connections found in this workbook.")
+
+    st.divider()
+    st.subheader("Sheet Flow Visual")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    tree_script_name = st.text_input("Tree visual script filename", value="Sheet_Trace_Visual_6.py")
+    tree_script_path = os.path.join(script_dir, tree_script_name)
+
+    if st.button("Open Sheet Flow Visual"):
+        if not os.path.exists(tree_script_path):
+            shell_box(f"Couldn't find {tree_script_name} in {script_dir}. Make sure it's saved in the same folder as this dashboard.", ok=False)
+        else:
+            subprocess.Popen([sys.executable, tree_script_path, tmp_path])
+            shell_box(f"Launched {tree_script_name} - check your browser for a new tab.", ok=True)
+
+    # -----------------------------------------------------------
+    # Source Classification - runs INLINE (imported directly, not
+    # launched as a separate process), reusing the SAME uploaded
+    # workbook already on this page. Results show right here as a
+    # table. Download button lives in its own section below.
+    #
+    # Stage ordering/labels are read from the loaded classifier
+    # module itself (gsc.STAGE_ORDER) rather than duplicated here -
+    # that module is the single source of truth for what stages
+    # exist, so this dashboard can never drift out of sync with it
+    # again the way it did when "External Process"/"External Output"
+    # were added to the classifier but not here.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Source Classification")
+    sc_script_name = st.text_input("Source Candidates script filename", value="Source_Candidates_1.py", key="sc_script_name")
+    sc_script_path = os.path.join(script_dir, sc_script_name)
+
+    if st.button("Run Source Classification"):
+        if not os.path.exists(sc_script_path):
+            shell_box(f"Couldn't find {sc_script_name} in {script_dir}. Make sure it's saved in the same folder as this dashboard.", ok=False)
+        else:
+            with st.spinner("Classifying sheets..."):
+                spec = importlib.util.spec_from_file_location("generate_source_candidates", sc_script_path)
+                gsc = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(gsc)
+
+                sheets_result = gsc.classify_all_sheets(tmp_path)
+                sheets_result.sort(key=lambda s: gsc.STAGE_ORDER[s[1]])
+
+                candidates_path = os.path.join(tmp_dir, "Data_Inventory_Candidates.xlsx")
+                gsc.build_output(sheets_result, candidates_path)
+
+            st.session_state["source_candidates"] = sheets_result
+            st.session_state["source_candidates_file"] = candidates_path
+            # Kept alongside the results so build_report_text() (called
+            # on every rerun via the download button below, long after
+            # this module object itself is gone) can still tally counts
+            # without hardcoding its own copy of the stage list.
+            st.session_state["source_stage_order"] = gsc.STAGE_ORDER
+
+    if "source_candidates" in st.session_state:
+        sc = st.session_state["source_candidates"]
+        st.dataframe(
+            [{"Sheet": name, "Stage": stage, "Structured %": f"{pct}%",
+              "Structured Cells": sc_count, "Unstructured Cells": unsc_count,
+              "Volume": vol, "External Refs": ext, "Fed by": ", ".join(sorted(fed)) if fed else ""}
+             for name, stage, fed, pct, sc_count, unsc_count, vol, ext in sc],
+            use_container_width=True,
+        )
+
+    # -----------------------------------------------------------
+    # Download Data Inventory Candidates - its own separate section,
+    # only shows once a classification has actually been run above.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Download Data Inventory Candidates")
+    if "source_candidates_file" in st.session_state:
+        with open(st.session_state["source_candidates_file"], "rb") as f:
+            st.download_button(
+                "Download Data_Inventory_Candidates.xlsx",
+                data=f.read(),
+                file_name="Data_Inventory_Candidates.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+    else:
+        st.caption("Run Source Classification above first to generate a file to download.")
+
+    # -----------------------------------------------------------
+    # Lineage Visualizer - LAUNCHED (same pattern as Sheet Flow
+    # Visual), since it's a custom interactive graph, not something
+    # that fits Streamlit's own widgets. Needs its OWN upload since
+    # it reads a filled-in lineage template, not the raw workpaper.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Lineage Visualizer")
+    st.caption("Uses a separate, manually-filled Data Inventory / Lineage Hops file - not the workbook uploaded above.")
+    lineage_upload = st.file_uploader("Drop your Data Lineage Template (.xlsx)", type=["xlsx"], key="lineage_upload")
+    lv_script_name = st.text_input("Lineage visual script filename", value="Lineage_Visual.py", key="lv_script_name")
+
+    if lineage_upload is not None:
+        lineage_bytes = lineage_upload.getbuffer().tobytes()
+        lineage_tmp_path = write_temp_file(tmp_dir, lineage_upload.name, lineage_bytes)
+        lv_script_path = os.path.join(script_dir, lv_script_name)
+
+        if st.button("Open Lineage Visual"):
+            if not os.path.exists(lv_script_path):
+                shell_box(f"Couldn't find {lv_script_name} in {script_dir}. Make sure it's saved in the same folder as this dashboard.", ok=False)
+            else:
+                subprocess.Popen([sys.executable, lv_script_path, lineage_tmp_path])
+                shell_box(f"Launched {lv_script_name} - check your browser for a new tab.", ok=True)
+
+    # -----------------------------------------------------------
+    # Manual Classification & Comparison - drag sheets into Input/
+    # Process/Output by hand (ground truth from actual domain
+    # knowledge), then CONFIRM it to lock it in as the solid,
+    # displayed source of truth. Everything downstream - the
+    # comparison against automated methods AND the flow-mapping
+    # visual - only becomes available once confirmed. This enforces
+    # the order: establish the real I/P/O first, THEN map flow on
+    # top of it, instead of the two happening interchangeably.
+    # -----------------------------------------------------------
+    st.divider()
+    st.subheader("Manual Classification & Comparison")
+    st.caption("Drag each sheet into Input, Process, or Output based on what you actually know about it, then confirm to lock it in. Flow mapping only unlocks after confirmation.")
+
+    sheet_names = r.get("sheet_names", [])
+    if sheet_names:
+        state_key = "manual_classification_state"
+        # Seeded ONCE per workbook, not rebuilt fresh every rerun. Streamlit
+        # reruns the whole script on every drag, and feeding the sortable
+        # widget a brand-new list object (same content, new identity) on
+        # every single one of those reruns - rather than exactly what it
+        # last handed back - is what was pushing the underlying
+        # drag-and-drop library into a React "too many re-renders" loop
+        # once there were enough sheets to drag. Keeping one persistent
+        # copy here and always feeding it back in avoids that reset cycle.
+        if state_key not in st.session_state:
+            st.session_state[state_key] = [
+                {"header": "Unclassified", "items": list(sheet_names)},
+                {"header": "Input", "items": []},
+                {"header": "Process", "items": []},
+                {"header": "Output", "items": []},
+            ]
+
+        use_simple_picker = st.checkbox(
+            "Use dropdown selection instead of drag-and-drop",
+            value=len(sheet_names) > 40,
+            help="Recommended for workbooks with a lot of sheets - the drag-and-drop "
+                 "widget can become unstable (a React error) once there are many "
+                 "items to drag. This does the exact same job without dragging: pick "
+                 "which sheets belong in each stage from three lists.",
+        )
+
+        if use_simple_picker:
+            # Seed the three multiselects ONCE from whatever's currently
+            # held (drag-and-drop state, or a previous run of this picker),
+            # so switching modes mid-session doesn't lose existing work.
+            # Only seeds if the key doesn't exist yet - after that, the
+            # widgets own their state via session_state directly.
+            current_stage = {}
+            for container in st.session_state[state_key]:
+                for sheet in container["items"]:
+                    current_stage[sheet] = container["header"]
+
+            for stage in ("Input", "Process", "Output"):
+                mkey = f"manual_stage_multiselect_{stage}"
+                if mkey not in st.session_state:
+                    st.session_state[mkey] = [s for s in sheet_names if current_stage.get(s) == stage]
+
+            # Each stage's OPTIONS exclude sheets already claimed by the
+            # other two (read fresh each rerun) - this is what keeps a
+            # sheet from ending up in more than one bucket at once: it
+            # simply isn't offered in a multiselect's dropdown once it's
+            # picked somewhere else, rather than needing to detect and
+            # resolve a conflict after the fact.
+            input_sel_prev = st.session_state.get("manual_stage_multiselect_Input", [])
+            process_sel_prev = st.session_state.get("manual_stage_multiselect_Process", [])
+            output_sel_prev = st.session_state.get("manual_stage_multiselect_Output", [])
+
+            input_sel = st.multiselect(
+                "Input sheets",
+                options=[s for s in sheet_names if s not in set(process_sel_prev) | set(output_sel_prev)],
+                key="manual_stage_multiselect_Input",
+            )
+            process_sel = st.multiselect(
+                "Process sheets",
+                options=[s for s in sheet_names if s not in set(input_sel_prev) | set(output_sel_prev)],
+                key="manual_stage_multiselect_Process",
+            )
+            output_sel = st.multiselect(
+                "Output sheets",
+                options=[s for s in sheet_names if s not in set(input_sel_prev) | set(process_sel_prev)],
+                key="manual_stage_multiselect_Output",
+            )
+
+            assigned = set(input_sel) | set(process_sel) | set(output_sel)
+            unclassified_sel = [s for s in sheet_names if s not in assigned]
+            if unclassified_sel:
+                st.caption(f"{len(unclassified_sel)} sheet(s) still Unclassified: {', '.join(sorted(unclassified_sel))}")
+
+            # Rebuilt into the same container shape the drag-and-drop widget
+            # produces, so everything downstream (Confirm Classification,
+            # the flow map builders) works identically either way.
+            st.session_state[state_key] = [
+                {"header": "Unclassified", "items": unclassified_sel},
+                {"header": "Input", "items": input_sel},
+                {"header": "Process", "items": process_sel},
+                {"header": "Output", "items": output_sel},
+            ]
+            sorted_result = st.session_state[state_key]
+        else:
+            sorted_result = sort_items(
+                st.session_state[state_key],
+                multi_containers=True,
+                direction="vertical",
+                key="manual_classification_sortable",
+            )
+            st.session_state[state_key] = sorted_result
+
+        if st.button("Confirm Classification", type="primary"):
+            manual_map = {}
+            unclassified_count = 0
+            for container in sorted_result:
+                bucket = container["header"]
+                items = container["items"]
+                if bucket == "Unclassified":
+                    unclassified_count = len(items)
+                    continue
+                for sheet in items:
+                    manual_map[sheet] = bucket
+
+            if not manual_map:
+                shell_box("No sheets classified yet - drag at least one sheet into Input, Process, or Output before confirming.", ok=False)
+            else:
+                st.session_state["manual_confirmed_stages"] = manual_map
+                st.session_state["manual_confirmed"] = True
+                st.session_state["manual_unclassified_count"] = unclassified_count
+
+        if st.session_state.get("manual_confirmed"):
+            confirmed = st.session_state["manual_confirmed_stages"]
+            shell_box(f"Classification confirmed - {len(confirmed)} sheet(s) locked in as ground truth.", ok=True)
+
+            # Solid display of the confirmed I/P/O - this is the actual
+            # answer, shown plainly before anything else happens with it.
+            stage_groups = {"Input": [], "Process": [], "Output": []}
+            for sheet, stage in confirmed.items():
+                stage_groups.setdefault(stage, []).append(sheet)
+
+            conf_col1, conf_col2, conf_col3 = st.columns(3)
+            for col, stage in zip((conf_col1, conf_col2, conf_col3), ("Input", "Process", "Output")):
+                with col:
+                    st.markdown(f"**{stage} ({len(stage_groups.get(stage, []))})**")
+                    if stage_groups.get(stage):
+                        for s in sorted(stage_groups[stage]):
+                            st.write(f"- {s}")
+                    else:
+                        st.caption("None")
+
+            unclassified_ct = st.session_state.get("manual_unclassified_count", 0)
+            if unclassified_ct:
+                st.caption(f"({unclassified_ct} sheet(s) still Unclassified - not included in the confirmed set above. Drag them into a bucket and re-confirm if they should be included.)")
+
+            st.divider()
+
+            if st.button("Compare Classifications"):
+                connectivity_stage = r.get("connectivity_stage", {})
+                source_stage = {}
+                if "source_candidates" in st.session_state:
+                    for name, stage, fed, pct, sc_count, unsc_count, vol, ext in st.session_state["source_candidates"]:
+                        source_stage[name] = stage
+
+                comparison_rows = []
+                conn_matches = 0
+                src_matches = 0
+                compared_count = 0
+                for sheet, manual_stage in confirmed.items():
+                    conn = connectivity_stage.get(sheet, "?")
+                    src = source_stage.get(sheet, "(not run)")
+                    conn_match = (conn == manual_stage)
+                    src_match = (src == manual_stage) if src != "(not run)" else None
+                    if conn_match:
+                        conn_matches += 1
+                    if src_match:
+                        src_matches += 1
+                    if src != "(not run)":
+                        compared_count += 1
+                    comparison_rows.append({
+                        "Sheet": sheet,
+                        "Manual": manual_stage,
+                        "Connectivity-Based": conn,
+                        "Connectivity Match": "Yes" if conn_match else "No",
+                        "Source Classification": src,
+                        "Source Match": ("Yes" if src_match else "No") if src_match is not None else "-",
+                    })
+
+                if comparison_rows:
+                    st.dataframe(comparison_rows, use_container_width=True)
+                    total = len(comparison_rows)
+                    conn_pct = round(conn_matches / total * 100, 1) if total else 0
+                    shell_box(f"Connectivity-based classification matched manual for {conn_matches}/{total} sheets ({conn_pct}%)", ok=(conn_pct >= 70))
+                    if compared_count:
+                        src_pct = round(src_matches / compared_count * 100, 1)
+                        shell_box(f"Source Classification matched manual for {src_matches}/{compared_count} sheets ({src_pct}%)", ok=(src_pct >= 70))
+                    else:
+                        shell_box("Source Classification hasn't been run yet - run it above to include it in this comparison.", ok=True)
+
+            # Flow mapping - only reachable after Confirm Classification
+            # has been clicked above. Uses the CONFIRMED map, not
+            # whatever is currently sitting in the drag-and-drop boxes,
+            # so the visual always reflects the locked-in ground truth.
+            if "flow" in r:
+                if st.button("Build Sheet Flow Visual (Manual Stages)"):
+                    html = build_manual_stage_tree_html(r["flow"], confirmed, sheet_names)
+                    out_path = os.path.join(tmp_dir, "manual_stage_tree.html")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write(html)
+                    webbrowser.open(f"file:///{out_path}")
+                    shell_box("Opened the visual in a new browser tab.", ok=True)
+
+                st.caption("Locked Input -> Process -> Output columns, showing only the real formula-flow path(s) from a confirmed Input to a confirmed Output.")
+                if st.button("Open Input \u2192 Output Flow Map"):
+                    html, error = build_staged_flow_html(r["flow"], confirmed, sheet_names)
+                    io_out_path = os.path.join(tmp_dir, "input_output_flow_map.html")
+                    if html is None:
+                        html = NO_PATH_HTML_TEMPLATE.replace("__MESSAGE__", error)
+                        with open(io_out_path, "w", encoding="utf-8") as f:
+                            f.write(html)
+                        webbrowser.open(f"file:///{io_out_path}")
+                        shell_box(error, ok=False)
+                    else:
+                        with open(io_out_path, "w", encoding="utf-8") as f:
+                            f.write(html)
+                        webbrowser.open(f"file:///{io_out_path}")
+                        shell_box("Opened the Input \u2192 Output flow map in a new browser tab.", ok=True)
+        else:
+            st.info("Drag sheets into Input, Process, or Output above, then click **Confirm Classification** to lock it in. Flow mapping unlocks after that.")
+    else:
+        st.caption("Run Health Check above first so sheet names are available to classify.")
+
+    def build_report_text():
+        BAR = "=" * 78
+        DASH = "-" * 78
+        lines = []
+
+        lines.append(BAR)
+        lines.append("EXCEL WORKBOOK HEALTH CHECK REPORT")
+        lines.append(BAR)
+        lines.append(f"Workbook:  {uploaded.name}")
+        lines.append(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"{r['formulas']} formulas across {r['sheets']} sheets")
+        lines.append("")
+
+        # --- Health Check section ---
+        lines.append(DASH)
+        lines.append("HEALTH CHECK")
+        lines.append(DASH)
+        lines.append("")
+
+        lines.append(f"Broken Links ({len(r['breaks'])})")
+        if r["breaks"]:
+            for s, c, f in r["breaks"]:
+                lines.append(f"  - {s}!{c} : {f}")
+        else:
+            lines.append("  None found.")
+        lines.append("")
+
+        lines.append(f"Circular References ({len(r['cycles'])})")
+        if r["cycles"]:
+            for cyc in r["cycles"]:
+                lines.append("  - " + " -> ".join(f"{s}!{c}" for s, c in cyc))
+        else:
+            lines.append("  None found.")
+        lines.append("")
+
+        lines.append(f"Isolated Sheets ({len(r['isolated'])})")
+        if r["isolated"]:
+            for s in r["isolated"]:
+                lines.append(f"  - {s}")
+        else:
+            lines.append("  None - every sheet is connected to the flow.")
+        lines.append("")
+
+        lines.append(f"Hidden Sheets ({len(r['hidden'])})")
+        if r["hidden"]:
+            for s, state in r["hidden"]:
+                lines.append(f"  - {s} ({state})")
+        else:
+            lines.append("  None found.")
+        lines.append("")
+
+        lines.append(f"External Data Connections ({len(r['connections'])})")
+        if r["connections"]:
+            for name, ctype, detail in r["connections"]:
+                lines.append(f"  - {name} ({ctype}): {detail}")
+        else:
+            lines.append("  None found.")
+        lines.append("")
+
+        # --- Confirmed Manual Classification section (only if confirmed) ---
+        if st.session_state.get("manual_confirmed"):
+            confirmed = st.session_state["manual_confirmed_stages"]
+            stage_groups = {"Input": [], "Process": [], "Output": []}
+            for sheet, stage in confirmed.items():
+                stage_groups.setdefault(stage, []).append(sheet)
+
+            lines.append(DASH)
+            lines.append("CONFIRMED CLASSIFICATION (MANUAL, GROUND TRUTH)")
+            lines.append(DASH)
+            lines.append("")
+            for stage in ("Input", "Process", "Output"):
+                sheets_in_stage = sorted(stage_groups.get(stage, []))
+                lines.append(f"{stage} ({len(sheets_in_stage)})")
+                if sheets_in_stage:
+                    for s in sheets_in_stage:
+                        lines.append(f"  - {s}")
+                else:
+                    lines.append("  None.")
+                lines.append("")
+        else:
+            lines.append(DASH)
+            lines.append("CONFIRMED CLASSIFICATION (MANUAL, GROUND TRUTH)")
+            lines.append(DASH)
+            lines.append("(Not confirmed yet - use the Manual Classification section above to lock it in.)")
+            lines.append("")
+
+        # --- Source Classification section (only if it's been run) ---
+        if "source_candidates" in st.session_state:
+            sc = st.session_state["source_candidates"]
+            # Stage list comes from the classifier module itself (saved
+            # when Source Classification was run), not a second hardcoded
+            # copy here - see comment above the "Run Source Classification"
+            # button for why. Falls back to whatever stages actually show
+            # up in the results if that wasn't saved for some reason, so
+            # this section can't itself throw a KeyError on an unknown stage.
+            stage_order = st.session_state.get("source_stage_order")
+            if stage_order:
+                stage_counts = {stage: 0 for stage in stage_order}
+            else:
+                stage_counts = {}
+            for _, stage, _, _, _, _, _, _ in sc:
+                stage_counts[stage] = stage_counts.get(stage, 0) + 1
+
+            lines.append(DASH)
+            lines.append("SOURCE CLASSIFICATION")
+            lines.append(DASH)
+            lines.append("")
+            summary_parts = [f"{count} {stage}" for stage, count in stage_counts.items() if count > 0]
+            lines.append(f"{len(sc)} sheet(s) total: " + ", ".join(summary_parts))
+            lines.append("")
+
+            col_widths = (22, 15, 9, 8, 10, 40)
+            header = ("Sheet", "Stage", "Struct%", "Volume", "Ext Refs", "Fed by")
+            lines.append("  ".join(h.ljust(w) for h, w in zip(header, col_widths)))
+            lines.append(DASH)
+            for name, stage, fed, pct, sc_count, unsc_count, vol, ext in sc:
+                fed_text = ", ".join(sorted(fed)) if fed else ""
+                row = (name, stage, f"{pct}%", str(vol), str(ext), fed_text)
+                lines.append("  ".join(str(v).ljust(w) for v, w in zip(row, col_widths)))
+            lines.append("")
+        else:
+            lines.append(DASH)
+            lines.append("SOURCE CLASSIFICATION")
+            lines.append(DASH)
+            lines.append("(Not run yet - use the Source Classification section above to include it here.)")
+            lines.append("")
+
+        lines.append(BAR)
+        lines.append("End of Report")
+        lines.append(BAR)
+        return "\n".join(lines)
+
+    st.download_button(
+        "Download Report (.txt)",
+        data=build_report_text(),
+        file_name="health_check_report.txt",
+        mime="text/plain",
+    )
+
+
+if __name__ == "__main__":
+    main()
