@@ -1036,7 +1036,16 @@ def find_cross_file_value_matches(folder_path, excel_filenames, block_size=5, mi
 # value-overlap connections as dashed/inferred edges on the same map.
 # ---------------------------------------------------------------
 
-EXTERNAL_REF_RE = re.compile(r"\[(\d+)\]")
+EXTERNAL_REF_RE = re.compile(
+    r"'\[(\d+)\][^'!]*'!"       # quoted form:   '[1]Sheet Name'!A1
+    r"|\[(\d+)\][A-Za-z_][A-Za-z0-9_.]*!"  # unquoted form: [1]Sheet1!A1
+)
+# Deliberately requires a trailing '!' - that's what a real external-workbook
+# cell reference always has and a Table structured reference (e.g.
+# Table1[2023] for a year-named column, common in tax workpapers) never
+# does, so this excludes structured refs without needing to special-case
+# them. Trade-off: external references to a NAMED RANGE with no sheet/'!'
+# (e.g. [1]MyDefinedName) are rare and intentionally not matched here.
 
 _OOXML_MAIN_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _OOXML_R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
@@ -1138,7 +1147,7 @@ def build_cross_file_formula_graph(folder_path, excel_filenames):
 
         for (sheet, cell), f in formulas.items():
             for m in EXTERNAL_REF_RE.finditer(f):
-                idx = int(m.group(1))
+                idx = int(m.group(1) or m.group(2))
                 ext_name = targets.get(idx)
                 if not ext_name:
                     skipped += 1
