@@ -1576,7 +1576,18 @@ def main():
             shell_box(f"'{folder_path}' isn't a valid folder path.", ok=False)
         else:
             entries = sorted(os.listdir(folder_path))
-            excel_files_for_flow = [e for e in entries if e.lower().endswith((".xlsx", ".xlsm"))]
+            # .xlsb included here (as a possible LINK TARGET only) even though
+            # extract_external_link_targets/load_workbook_data can't read
+            # formulas from inside a .xlsb - it uses Excel's binary format
+            # internally (workbook.bin, not workbook.xml), not the XML this
+            # parser reads. Leaving .xlsb out of this list entirely was why
+            # links pointing AT a real, present .xlsb file were coming back
+            # "unresolved" - the file's name was never even a candidate to
+            # match against. Including it here fixes matching; it will only
+            # ever appear as a source (something pulled FROM), not as a file
+            # with its own outgoing links, unless a binary-xlsb reader (e.g.
+            # pyxlsb) is added later.
+            excel_files_for_flow = [e for e in entries if e.lower().endswith((".xlsx", ".xlsm", ".xlsb"))]
             if not excel_files_for_flow:
                 shell_box("No .xlsx or .xlsm files found in that folder.", ok=False)
             else:
