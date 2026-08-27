@@ -1111,20 +1111,27 @@ def extract_external_link_targets(path):
     return targets
 
 
-def build_cross_file_formula_graph(folder_path, excel_filenames):
-    """Scans every workbook in the folder for formulas that reference an
-    EXTERNAL workbook (Excel's own [N] index syntax), resolves each [N]
-    to a real file name via extract_external_link_targets, and - only
-    when that file name matches another file actually present in this
-    same folder - records a file-to-file edge.
+def build_cross_file_formula_graph(file_paths):
+    """Scans every workbook in file_paths (dict: filename -> full path on
+    disk) for formulas that reference an EXTERNAL workbook (Excel's own
+    [N] index syntax), resolves each [N] to a real file name via
+    extract_external_link_targets, and - only when that file name
+    matches another file actually present in file_paths - records a
+    file-to-file edge.
+
+    Taking a name->path map (rather than a folder_path + a list of names
+    assumed to live directly under it) is what lets the caller include
+    files from subfolders: matching is always done by filename, exactly
+    as Excel recorded it in the external link, regardless of which
+    subfolder the file actually lives in on disk.
 
     Matching tries an EXACT filename first, then falls back to matching
-    by filename STEM (name without extension) if exactly one file in the
-    folder shares that stem - this covers the common case where a link
-    was created against a .xlsm and the file was later saved as .xlsx
-    (or vice versa), which otherwise looks identical to a genuinely
-    missing file. If more than one file shares the stem, it's left
-    unresolved rather than guessing which one.
+    by filename STEM (name without extension) if exactly one file shares
+    that stem - this covers the common case where a link was created
+    against a .xlsm and the file was later saved as .xlsx (or vice
+    versa), which otherwise looks identical to a genuinely missing file.
+    If more than one file shares the stem, it's left unresolved rather
+    than guessing which one.
 
     Edge direction follows the same convention as the sheet-to-sheet
     flow elsewhere in this dashboard: (source_file, dest_file), meaning
@@ -1134,7 +1141,7 @@ def build_cross_file_formula_graph(folder_path, excel_filenames):
     Returns (edges, skipped, unresolved):
       edges      - {(src_file, dst_file): formula_cell_count}
       skipped    - total count of external-ref formula cells that didn't
-                    resolve to a file in this folder
+                    resolve to a file in file_paths
       unresolved - {display_name: count} breakdown of WHY - either the
                     actual external file name Excel recorded (so you can
                     see if it's a rename/extension mismatch or a
@@ -1143,18 +1150,17 @@ def build_cross_file_formula_graph(folder_path, excel_filenames):
                     couldn't be resolved at all - shown so you're not
                     just staring at one opaque number.
     """
-    filenames_in_folder = {f.lower(): f for f in excel_filenames}
+    filenames_in_folder = {name.lower(): name for name in file_paths}
     filenames_by_stem = {}
-    for f in excel_filenames:
-        stem = os.path.splitext(f)[0].lower()
-        filenames_by_stem.setdefault(stem, []).append(f)
+    for name in file_paths:
+        stem = os.path.splitext(name)[0].lower()
+        filenames_by_stem.setdefault(stem, []).append(name)
 
     edges = {}
     skipped = 0
     unresolved = {}
 
-    for fname in excel_filenames:
-        fpath = os.path.join(folder_path, fname)
+    for fname, fpath in file_paths.items():
         try:
             targets = extract_external_link_targets(fpath)
             if not targets:
@@ -1296,11 +1302,14 @@ def build_cross_file_flow_html(edges):
 
 
 @st.cache_data(show_spinner=False)
-def build_cross_file_formula_graph_cached(folder_path, excel_filenames, fingerprints):
-    """Same caching pattern as scan_one_excel_cached - keyed on the file
-    list plus each file's (mtime, size), so an unchanged folder returns
-    instantly and any file that's changed correctly triggers a rescan."""
-    return build_cross_file_formula_graph(folder_path, list(excel_filenames))
+def build_cross_file_formula_graph_cached(file_items, fingerprints):
+    """Same caching pattern as scan_one_excel_cached - keyed on the
+    (name, path) list plus each file's (mtime, size), so an unchanged
+    set of files returns instantly and any file that's changed - or any
+    file added/removed, e.g. by toggling subfolders on/off - correctly
+    triggers a rescan. file_items is a tuple of (name, path) pairs
+    (hashable, for caching) rather than a dict."""
+    return build_cross_file_formula_graph(dict(file_items))
 
 
 def check_external_connections(path):
@@ -1570,33 +1579,56 @@ def main():
         "likely relationships from shared numbers with no formula link at all. A later "
         "version can layer those in as dashed/inferred edges on the same map."
     )
+    include_subfolders_flow = st.checkbox(
+        "Include subfolders",
+        value=False,
+        key="cross_file_flow_subfolders",
+        help="The folder path above is otherwise scanned top-level only. Check this if your "
+             "workpapers are organized into category subfolders (e.g. Depreciation/, Capital "
+             "Interest/) - a referenced file sitting one level down is the most common reason "
+             "a real, present file shows up as 'not found'.",
+    )
 
     if st.button("Build Cross-File Formula Flow Map"):
         if not folder_path or not os.path.isdir(folder_path):
             shell_box(f"'{folder_path}' isn't a valid folder path.", ok=False)
         else:
-            entries = sorted(os.listdir(folder_path))
             # .xlsb included here (as a possible LINK TARGET only) even though
             # extract_external_link_targets/load_workbook_data can't read
             # formulas from inside a .xlsb - it uses Excel's binary format
             # internally (workbook.bin, not workbook.xml), not the XML this
-            # parser reads. Leaving .xlsb out of this list entirely was why
-            # links pointing AT a real, present .xlsb file were coming back
-            # "unresolved" - the file's name was never even a candidate to
-            # match against. Including it here fixes matching; it will only
-            # ever appear as a source (something pulled FROM), not as a file
-            # with its own outgoing links, unless a binary-xlsb reader (e.g.
-            # pyxlsb) is added later.
-            excel_files_for_flow = [e for e in entries if e.lower().endswith((".xlsx", ".xlsm", ".xlsb"))]
-            if not excel_files_for_flow:
-                shell_box("No .xlsx or .xlsm files found in that folder.", ok=False)
+            # parser reads. It will only ever appear as a source (something
+            # pulled FROM), not as a file with its own outgoing links, unless
+            # a binary-xlsb reader (e.g. pyxlsb) is added later.
+            file_paths = {}
+            duplicate_names = set()
+            if include_subfolders_flow:
+                for root, _dirs, files in os.walk(folder_path):
+                    for fn in files:
+                        if fn.lower().endswith((".xlsx", ".xlsm", ".xlsb")):
+                            if fn in file_paths:
+                                duplicate_names.add(fn)
+                                continue  # keep first occurrence only - ambiguous which one Excel meant
+                            file_paths[fn] = os.path.join(root, fn)
             else:
-                with st.spinner(f"Scanning {len(excel_files_for_flow)} file(s) for external workbook references..."):
-                    fingerprints = tuple(
-                        _file_fingerprint(os.path.join(folder_path, f)) for f in excel_files_for_flow
-                    )
-                    edges, skipped, unresolved = build_cross_file_formula_graph_cached(
-                        folder_path, tuple(excel_files_for_flow), fingerprints
+                for fn in sorted(os.listdir(folder_path)):
+                    if fn.lower().endswith((".xlsx", ".xlsm", ".xlsb")):
+                        file_paths[fn] = os.path.join(folder_path, fn)
+
+            if not file_paths:
+                where = " (including subfolders)" if include_subfolders_flow else ""
+                shell_box(f"No .xlsx, .xlsm, or .xlsb files found in that folder{where}.", ok=False)
+            else:
+                with st.spinner(f"Scanning {len(file_paths)} file(s) for external workbook references..."):
+                    fingerprints = tuple(_file_fingerprint(p) for p in file_paths.values())
+                    file_items = tuple(file_paths.items())
+                    edges, skipped, unresolved = build_cross_file_formula_graph_cached(file_items, fingerprints)
+
+                if duplicate_names:
+                    st.caption(
+                        f"Note: {len(duplicate_names)} filename(s) appeared in more than one subfolder - "
+                        f"only the first occurrence of each was used, so a match against one of these could "
+                        f"be pointing at the wrong copy: {', '.join(sorted(duplicate_names))}"
                     )
 
                 if not edges:
