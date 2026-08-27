@@ -1118,22 +1118,40 @@ def build_cross_file_formula_graph(folder_path, excel_filenames):
     when that file name matches another file actually present in this
     same folder - records a file-to-file edge.
 
+    Matching tries an EXACT filename first, then falls back to matching
+    by filename STEM (name without extension) if exactly one file in the
+    folder shares that stem - this covers the common case where a link
+    was created against a .xlsm and the file was later saved as .xlsx
+    (or vice versa), which otherwise looks identical to a genuinely
+    missing file. If more than one file shares the stem, it's left
+    unresolved rather than guessing which one.
+
     Edge direction follows the same convention as the sheet-to-sheet
     flow elsewhere in this dashboard: (source_file, dest_file), meaning
     data flows FROM source INTO dest (dest's formula is the one doing
     the pulling).
 
-    Returns (edges, skipped):
-      edges   - {(src_file, dst_file): formula_cell_count}
-      skipped - count of external-ref formula cells whose target file
-                name wasn't found among the scanned folder's files (a
-                link to something outside the batch, or a stale/renamed
-                reference) - shown as a caption, not an error, since
-                that's expected and not necessarily a problem.
+    Returns (edges, skipped, unresolved):
+      edges      - {(src_file, dst_file): formula_cell_count}
+      skipped    - total count of external-ref formula cells that didn't
+                    resolve to a file in this folder
+      unresolved - {display_name: count} breakdown of WHY - either the
+                    actual external file name Excel recorded (so you can
+                    see if it's a rename/extension mismatch or a
+                    genuinely different file), or "(index [N] not found
+                    in <file>'s external link list)" if the [N] itself
+                    couldn't be resolved at all - shown so you're not
+                    just staring at one opaque number.
     """
     filenames_in_folder = {f.lower(): f for f in excel_filenames}
+    filenames_by_stem = {}
+    for f in excel_filenames:
+        stem = os.path.splitext(f)[0].lower()
+        filenames_by_stem.setdefault(stem, []).append(f)
+
     edges = {}
     skipped = 0
+    unresolved = {}
 
     for fname in excel_filenames:
         fpath = os.path.join(folder_path, fname)
@@ -1150,16 +1168,27 @@ def build_cross_file_formula_graph(folder_path, excel_filenames):
                 idx = int(m.group(1) or m.group(2))
                 ext_name = targets.get(idx)
                 if not ext_name:
+                    label = f"(index [{idx}] not found in {fname}'s external link list)"
+                    unresolved[label] = unresolved.get(label, 0) + 1
                     skipped += 1
                     continue
+
                 match = filenames_in_folder.get(ext_name.lower())
+                if not match:
+                    stem = os.path.splitext(ext_name)[0].lower()
+                    candidates = filenames_by_stem.get(stem, [])
+                    if len(candidates) == 1:
+                        match = candidates[0]
+
                 if not match or match == fname:
+                    unresolved[ext_name] = unresolved.get(ext_name, 0) + 1
                     skipped += 1
                     continue
+
                 key = (match, fname)
                 edges[key] = edges.get(key, 0) + 1
 
-    return edges, skipped
+    return edges, skipped, unresolved
 
 
 CROSS_FILE_FLOW_HTML_TEMPLATE = """<!doctype html>
@@ -1555,7 +1584,7 @@ def main():
                     fingerprints = tuple(
                         _file_fingerprint(os.path.join(folder_path, f)) for f in excel_files_for_flow
                     )
-                    edges, skipped = build_cross_file_formula_graph_cached(
+                    edges, skipped, unresolved = build_cross_file_formula_graph_cached(
                         folder_path, tuple(excel_files_for_flow), fingerprints
                     )
 
@@ -1574,6 +1603,19 @@ def main():
                     if skipped:
                         msg += f" ({skipped} reference(s) skipped - target file not in this folder.)"
                     shell_box(msg, ok=True)
+
+                if unresolved:
+                    with st.expander(f"Unresolved external references ({len(unresolved)} distinct target(s), {skipped} formula cell(s) total)"):
+                        st.caption(
+                            "What each unmatched reference actually points to, so you can tell a "
+                            "genuinely-external file apart from a rename/extension mismatch or a "
+                            "broken/orphaned link index."
+                        )
+                        unresolved_rows = sorted(
+                            [{"Referenced as": name, "Formula cells": count} for name, count in unresolved.items()],
+                            key=lambda row: -row["Formula cells"],
+                        )
+                        st.dataframe(unresolved_rows, use_container_width=True)
 
     st.divider()
 
