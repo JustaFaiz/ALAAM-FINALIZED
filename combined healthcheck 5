@@ -1142,13 +1142,16 @@ def build_cross_file_formula_graph(file_paths):
       edges      - {(src_file, dst_file): formula_cell_count}
       skipped    - total count of external-ref formula cells that didn't
                     resolve to a file in file_paths
-      unresolved - {display_name: count} breakdown of WHY - either the
-                    actual external file name Excel recorded (so you can
-                    see if it's a rename/extension mismatch or a
-                    genuinely different file), or "(index [N] not found
-                    in <file>'s external link list)" if the [N] itself
-                    couldn't be resolved at all - shown so you're not
-                    just staring at one opaque number.
+      unresolved - {display_name: {"total": int, "by_file": {fname: count},
+                    "examples": [(fname, sheet, cell), ...]}} - a
+                    breakdown of WHY a reference didn't resolve (either
+                    the actual external file name Excel recorded, or
+                    "(index [N] not found in <file>'s external link
+                    list)" if the [N] itself couldn't be resolved),
+                    which file(s) contain the referencing formulas, and
+                    a capped set of example sheet!cell locations for
+                    spot-checking - so you're not just staring at one
+                    opaque number.
     """
     filenames_in_folder = {name.lower(): name for name in file_paths}
     filenames_by_stem = {}
@@ -1158,7 +1161,14 @@ def build_cross_file_formula_graph(file_paths):
 
     edges = {}
     skipped = 0
-    unresolved = {}
+    unresolved = {}  # name -> {"total": int, "by_file": {fname: count}, "examples": [(fname, sheet, cell), ...]}
+
+    def record_unresolved(name, fname, sheet, cell):
+        entry = unresolved.setdefault(name, {"total": 0, "by_file": {}, "examples": []})
+        entry["total"] += 1
+        entry["by_file"][fname] = entry["by_file"].get(fname, 0) + 1
+        if len(entry["examples"]) < 5:  # capped - just enough to spot-check, not a full audit trail
+            entry["examples"].append((fname, sheet, cell))
 
     for fname, fpath in file_paths.items():
         try:
@@ -1175,7 +1185,7 @@ def build_cross_file_formula_graph(file_paths):
                 ext_name = targets.get(idx)
                 if not ext_name:
                     label = f"(index [{idx}] not found in {fname}'s external link list)"
-                    unresolved[label] = unresolved.get(label, 0) + 1
+                    record_unresolved(label, fname, sheet, cell)
                     skipped += 1
                     continue
 
@@ -1187,7 +1197,7 @@ def build_cross_file_formula_graph(file_paths):
                         match = candidates[0]
 
                 if not match or match == fname:
-                    unresolved[ext_name] = unresolved.get(ext_name, 0) + 1
+                    record_unresolved(ext_name, fname, sheet, cell)
                     skipped += 1
                     continue
 
@@ -1631,12 +1641,7 @@ def main():
                         f"be pointing at the wrong copy: {', '.join(sorted(duplicate_names))}"
                     )
 
-                if not edges:
-                    msg = "No direct formula links between files in this folder were found."
-                    if skipped:
-                        msg += f" ({skipped} external-workbook reference(s) pointed to a file not in this folder.)"
-                    shell_box(msg, ok=False)
-                else:
+                if edges:
                     html = build_cross_file_flow_html(edges)
                     out_path = os.path.join(tempfile.gettempdir(), "cross_file_formula_flow.html")
                     with open(out_path, "w", encoding="utf-8") as f:
@@ -1644,20 +1649,48 @@ def main():
                     webbrowser.open(f"file:///{out_path}")
                     msg = f"Opened the Cross-File Formula Flow Map - {len(edges)} file-to-file link(s) found."
                     if skipped:
-                        msg += f" ({skipped} reference(s) skipped - target file not in this folder.)"
+                        msg += f" ({skipped} reference(s) point outside this folder - see below.)"
                     shell_box(msg, ok=True)
+                elif skipped:
+                    # Not a failure - this IS the finding: real formula dependencies exist,
+                    # they just point at files that aren't anywhere under the scanned folder
+                    # (at any depth). Framed as a neutral discovery, not an error, and the
+                    # table below is the primary output in this case, not a footnote.
+                    shell_box(
+                        f"No formula links were found BETWEEN files in this folder - but {len(unresolved)} "
+                        f"external dependencies were found, referenced across {skipped} formula cell(s), "
+                        f"pointing to files outside the scanned folder. See the breakdown below.",
+                        ok=True,
+                    )
+                else:
+                    shell_box("No external-workbook formula references were found in any file in this folder.", ok=False)
 
                 if unresolved:
-                    with st.expander(f"Unresolved external references ({len(unresolved)} distinct target(s), {skipped} formula cell(s) total)"):
+                    with st.expander(
+                        f"External dependencies ({len(unresolved)} distinct file(s), {skipped} formula cell(s) total)",
+                        expanded=not edges,  # the primary output when nothing resolved within the folder
+                    ):
                         st.caption(
-                            "What each unmatched reference actually points to, so you can tell a "
-                            "genuinely-external file apart from a rename/extension mismatch or a "
-                            "broken/orphaned link index."
+                            "What each unresolved reference actually points to, which file(s) in this "
+                            "folder contain the referencing formulas, and a few example cell locations "
+                            "so you can jump straight to them in Excel to verify or trace further."
                         )
-                        unresolved_rows = sorted(
-                            [{"Referenced as": name, "Formula cells": count} for name, count in unresolved.items()],
-                            key=lambda row: -row["Formula cells"],
-                        )
+                        unresolved_rows = []
+                        for name, info in unresolved.items():
+                            by_file_text = ", ".join(
+                                f"{fname} ({cnt})"
+                                for fname, cnt in sorted(info["by_file"].items(), key=lambda kv: -kv[1])
+                            )
+                            example_text = "; ".join(
+                                f"{fname} \u2192 {sheet}!{cell}" for fname, sheet, cell in info["examples"]
+                            )
+                            unresolved_rows.append({
+                                "External file referenced": name,
+                                "Formula cells": info["total"],
+                                "Referenced from (file: cell count)": by_file_text,
+                                "Example locations": example_text,
+                            })
+                        unresolved_rows.sort(key=lambda row: -row["Formula cells"])
                         st.dataframe(unresolved_rows, use_container_width=True)
 
     st.divider()
