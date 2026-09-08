@@ -1,0 +1,28 @@
+from moviepy import VideoFileClip, concatenate_videoclips
+
+# Step 1: Define your videos and the timestamps you want to keep
+clips_dict = {
+    "video1.mp4": [(10, 25), (40, 55)],   # keep 10-25s and 40-55s
+    "video2.mp4": [(5, 20)],
+    "video3.mp4": [(0, 12), (30, 45)]
+}
+
+# Step 2: Extract the segments
+final_segments = []
+
+for filepath, timestamps in clips_dict.items():
+    video = VideoFileClip(filepath)
+    for start, end in timestamps:
+        segment = video.subclipped(start, end)
+        final_segments.append(segment)
+
+# Step 3: Concatenate all segments into one video
+final_video = concatenate_videoclips(final_segments, method="compose")
+
+# Step 4: Export
+final_video.write_videofile("output.mp4", codec="libx264", audio_codec="aac")
+
+# Step 5 (optional but good practice): close clips to free memory
+for segment in final_segments:
+    segment.close()
+final_video.close()
