@@ -14,16 +14,13 @@ Requires:
 
 Usage:
     python sheet_tree_server.py workbook.xlsx
-    python sheet_tree_server.py workbook.xlsx 500   (200+-cell floor becomes 500+)
 
-By default, only sheets connected by a 200+-cell link are shown (the
-"floor" - always on, overridable via the optional second argument
-above). Once the tree is open in your browser, the "Min Incoming
-Arrows" / "Min Outgoing Arrows" number fields let you ADD more sheets
-on top of that floor - e.g. a sheet with many weak (sub-200-cell)
-links can be revealed by raising one of these fields, and its weaker
-links get drawn too. The floor never gets removed by these fields;
-they only add sheets, never hide the ones the floor already shows.
+Every cross-sheet formula link is shown by default, including
+single-cell links. Once the tree is open in your browser, use the
+"Min Incoming Arrows" / "Min Outgoing Arrows" number fields to filter
+which sheets are displayed, based on how many distinct arrows point
+into/out of each sheet (a sheet stays visible if it meets EITHER
+threshold; leaving both at 0 shows everything).
 
 This opens the tree in your browser automatically and starts a local
 server. Leave the terminal window open while you use it - closing it
@@ -55,11 +52,6 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 
 PORT = 0  # 0 = let the OS pick a free port - avoids collisions with a still-running
           # earlier session, which was silently serving stale data on a fixed port
-
-# An arrow (sheet-to-sheet link) is only drawn - and only counted toward a
-# sheet's incoming/outgoing arrow count - if it's backed by at least this
-# many formula cells. Overridable via an optional second CLI argument.
-DEFAULT_MIN_CELLS_PER_ARROW = 200
 
 CELL_REF_RE = re.compile(
     r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
@@ -515,7 +507,7 @@ HTML_TEMPLATE = """<!doctype html>
       <input type="number" id="minOutgoing" min="0" step="1" value="0">
       <span class="hint">(max __MAX_OUT__)</span>
     </div>
-    <span style="opacity:0.8;">Sheets with a __MIN_CELLS_PER_ARROW__+-cell link are always shown. Raise a field above 0 to also show sheets with that many arrows (any strength) - their weaker links get drawn too.</span><br>
+    <span style="opacity:0.8;">A sheet stays visible if it meets EITHER threshold. Leave both at 0 to show everything.</span><br>
     <span id="resetThresholdsBtn">Reset thresholds</span>
   </div>
   <span id="status" style="opacity:0.8;"></span>
@@ -661,22 +653,21 @@ HTML_TEMPLATE = """<!doctype html>
     this.innerText = listVisible ? '[show list]' : '[hide list]';
   });
 
-  // --- Incoming / Outgoing ARROW COUNT filter (additive, on top of the floor) ---
-  // node.incoming / node.outgoing are ARROW counts over ALL links (weak
-  // and strong alike) - how many distinct sheets feed into/out of this
-  // sheet. node.hasStrong marks a sheet that touches at least one link
-  // with >= __MIN_CELLS_PER_ARROW__ cells - that's the permanent floor,
-  // always shown regardless of what's typed into the fields below.
+  // --- Incoming / Outgoing arrow count filter ---
+  // node.incoming / node.outgoing are ARROW counts (in-degree/out-degree)
+  // - how many distinct sheets feed into/out of this sheet, regardless
+  // of how many cells any individual link carries.
   //
-  // A field left at 0 means "not applied" (every sheet trivially has
-  // incoming/outgoing >= 0, so treating 0 as a real threshold would show
-  // everything and erase the floor) - so the arrow-count check is only
-  // applied once a field is actually raised above 0. A sheet is visible
-  // if: hasStrong, OR minIncoming>0 and incoming>=minIncoming, OR
-  // minOutgoing>0 and outgoing>=minOutgoing. Since vis-network hides an
-  // edge whenever either endpoint node is hidden, a weak link between
-  // two sheets that both end up visible is drawn automatically - no
-  // separate edge-level filter is needed.
+  // Both fields at 0 means "no filter applied" - everything is shown.
+  // Raising either field above 0 engages it: a sheet then stays visible
+  // if it meets EITHER engaged threshold (a field left at 0 is ignored,
+  // not treated as "threshold of zero" - every sheet trivially has
+  // incoming/outgoing >= 0, so treating 0 as a real threshold would
+  // show everything regardless of the other field).
+  //
+  // Since vis-network hides an edge whenever either endpoint node is
+  // hidden, a link between two sheets that are both visible is drawn
+  // automatically - no separate edge-level filter is needed.
   var minIncomingInput = document.getElementById('minIncoming');
   var minOutgoingInput = document.getElementById('minOutgoing');
 
@@ -686,13 +677,16 @@ HTML_TEMPLATE = """<!doctype html>
     var minOut = parseInt(minOutgoingInput.value, 10);
     if (isNaN(minOut) || minOut < 0) minOut = 0;
 
-    var changes = allSheetIds.map(function(id) {
-      var node = nodes.get(id);
-      var passes = node.hasStrong
-        || (minIn > 0 && node.incoming >= minIn)
-        || (minOut > 0 && node.outgoing >= minOut);
-      return { id: id, hidden: !passes };
-    });
+    var changes;
+    if (minIn === 0 && minOut === 0) {
+      changes = allSheetIds.map(function(id) { return { id: id, hidden: false }; });
+    } else {
+      changes = allSheetIds.map(function(id) {
+        var node = nodes.get(id);
+        var passes = (minIn > 0 && node.incoming >= minIn) || (minOut > 0 && node.outgoing >= minOut);
+        return { id: id, hidden: !passes };
+      });
+    }
     applyChanges(changes);
   }
 
@@ -773,29 +767,18 @@ HTML_TEMPLATE = """<!doctype html>
 """
 
 
-def build_html(flow, min_cells_per_arrow=DEFAULT_MIN_CELLS_PER_ARROW):
-    """Builds the vis-network tree HTML. ALL cross-sheet links are sent
-    to the browser, including ones weaker than min_cells_per_arrow -
-    which sheets are actually shown is decided dynamically client-side,
-    not here, so a weak link can still be revealed via the arrow-count
-    fields.
+def build_html(flow):
+    """Builds the vis-network tree HTML. Every cross-sheet link is sent
+    to the browser and shown by default, including single-cell links.
 
-    Each node carries:
-    - incoming / outgoing: ARROW counts (in-degree/out-degree) over ALL
-      links touching that sheet, weak or strong - NOT a sum of cell
-      counts, and NOT restricted to strong links. This is what the
-      browser's Min Incoming/Min Outgoing Arrows fields filter on.
-    - hasStrong: true if the sheet touches at least one link (in either
-      direction) with a cell count >= min_cells_per_arrow. A sheet with
-      hasStrong=true is ALWAYS shown by default, regardless of the
-      arrow-count fields - this is the permanent 200+-cell floor. The
-      arrow-count fields only ADD sheets on top of that floor; they
-      never remove a strong sheet.
+    Each node carries its ARROW count - incoming/outgoing in-degree/
+    out-degree, i.e. how many distinct sheets feed into/out of it - as
+    a second label line and in the hover tooltip. This is what the
+    browser's Min Incoming/Min Outgoing Arrows fields filter on.
 
     Since vis-network automatically hides an edge whenever either of its
-    endpoint nodes is hidden, a weak link between two sheets that are
-    BOTH visible (for any reason) is drawn too - there's no separate
-    edge-level filter needed."""
+    endpoint nodes is hidden, filtering is purely node-level - no
+    separate edge filter is needed."""
     if not flow:
         return None
 
@@ -804,7 +787,6 @@ def build_html(flow, min_cells_per_arrow=DEFAULT_MIN_CELLS_PER_ARROW):
     has_outgoing = set()
     incoming_arrows = {}
     outgoing_arrows = {}
-    strong_sheets = set()
     for (src, dst), count in flow.items():
         all_sheets.add(src)
         all_sheets.add(dst)
@@ -812,9 +794,6 @@ def build_html(flow, min_cells_per_arrow=DEFAULT_MIN_CELLS_PER_ARROW):
         has_incoming.add(dst)
         outgoing_arrows[src] = outgoing_arrows.get(src, 0) + 1
         incoming_arrows[dst] = incoming_arrows.get(dst, 0) + 1
-        if count >= min_cells_per_arrow:
-            strong_sheets.add(src)
-            strong_sheets.add(dst)
 
     roots = all_sheets - has_incoming
     leaves = all_sheets - has_outgoing
@@ -832,20 +811,15 @@ def build_html(flow, min_cells_per_arrow=DEFAULT_MIN_CELLS_PER_ARROW):
             color = "#2a9d8f"
         incoming = incoming_arrows.get(sheet, 0)
         outgoing = outgoing_arrows.get(sheet, 0)
-        has_strong = sheet in strong_sheets
         nodes.append({
             "id": sheet,
             "label": f"{sheet}\n(arrows in:{incoming} out:{outgoing})",
             "color": color,
             "shape": "box", "size": 25,
-            "borderWidth": 3 if has_strong else 1,
-            "hidden": not has_strong,  # initial view: only the 200+-cell floor is shown
             "incoming": incoming,
             "outgoing": outgoing,
-            "hasStrong": has_strong,
             "title": (
-                f"{sheet}\nIncoming arrows: {incoming} (all links)\nOutgoing arrows: {outgoing} (all links)"
-                f"\nHas a {min_cells_per_arrow}+-cell link: {'Yes' if has_strong else 'No'}"
+                f"{sheet}\nIncoming arrows: {incoming}\nOutgoing arrows: {outgoing}"
                 "\nClick to switch to this sheet in Excel"
             ),
         })
@@ -861,7 +835,6 @@ def build_html(flow, min_cells_per_arrow=DEFAULT_MIN_CELLS_PER_ARROW):
 
     html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
     html = html.replace("__MAX_IN__", str(max_incoming)).replace("__MAX_OUT__", str(max_outgoing))
-    html = html.replace("__MIN_CELLS_PER_ARROW__", str(min_cells_per_arrow))
     return html
 
 
@@ -914,37 +887,21 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python sheet_tree_server.py <workbook.xlsx> [min_cells_per_arrow]")
+        print("Usage: python sheet_tree_server.py <workbook.xlsx>")
         print("No file argument given - exiting rather than opening a hardcoded sample.")
         sys.exit(1)
     path = sys.argv[1]
-
-    min_cells_per_arrow = DEFAULT_MIN_CELLS_PER_ARROW
-    if len(sys.argv) >= 3:
-        try:
-            min_cells_per_arrow = int(sys.argv[2])
-        except ValueError:
-            pass
 
     formulas, sheetnames, sheet_bounds = load_formulas(path)
     print(f"Loaded {len(formulas)} formulas across {len(sheetnames)} sheet(s).")
 
     flow, precedent_cells, dependent_cells = build_sheet_flow(formulas, sheet_bounds)
-    strong_link_count = sum(1 for v in flow.values() if v >= min_cells_per_arrow)
-    strong_sheets = set()
-    for (src, dst), count in flow.items():
-        if count >= min_cells_per_arrow:
-            strong_sheets.add(src)
-            strong_sheets.add(dst)
-    print(f"Found {len(flow)} distinct sheet-to-sheet link(s) total. By default, "
-          f"{len(strong_sheets)} sheet(s) with a {min_cells_per_arrow}+-cell link "
-          f"are shown ({strong_link_count} such link(s)). Use the Min Incoming/Min "
-          f"Outgoing Arrows fields in the browser to reveal additional sheets, even "
-          f"ones connected only by weaker links - or re-run with a different "
-          f"threshold as a second argument.")
+    print(f"Found {len(flow)} distinct sheet-to-sheet link(s) - all shown by default. "
+          f"Use the Min Incoming/Min Outgoing Arrows fields in the browser to filter "
+          f"sheets by how many arrows connect to them.")
 
     # Write the companion trace-data workbook - a complete record of
-    # every cross-sheet link found (not limited by min_cells_per_arrow).
+    # every cross-sheet link found.
     base, _ext = os.path.splitext(os.path.abspath(path))
     trace_output_path = base + "_trace_data.xlsx"
     try:
@@ -953,7 +910,7 @@ def main():
     except Exception as e:
         print(f"[!] Could not write trace data Excel file: {e}")
 
-    html = build_html(flow, min_cells_per_arrow=min_cells_per_arrow)
+    html = build_html(flow)
     if html is None:
         print("No cross-sheet formula links found - nothing to draw.")
         return
