@@ -36,6 +36,7 @@ feeds, reference counts in each direction, and the cross-sheet
 formulas located on that sheet.
 """
 
+import datetime
 import json
 import os
 import re
@@ -47,8 +48,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from openpyxl import load_workbook, Workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.chart import BarChart, Reference
 
 PORT = 0  # 0 = let the OS pick a free port - avoids collisions with a still-running
           # earlier session, which was silently serving stale data on a fixed port
@@ -259,6 +262,212 @@ def export_trace_to_excel(formulas, sheet_bounds, flow, sheetnames, output_path)
         ws.column_dimensions[get_column_letter(i)].width = w
 
     ws.freeze_panes = "A2"
+    wb.save(output_path)
+    return output_path
+
+
+HEADER_FILL = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
+HEADER_FONT = Font(bold=True, color="FFFFFF")
+TABLE_STYLE = TableStyleInfo(
+    name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False,
+    showLastColumn=False, showColumnStripes=False,
+)
+
+
+def _write_table(ws, start_row, table_name, headers, rows, col_widths=None):
+    """Writes headers+rows starting at (start_row, col 1) and wraps them
+    as a real Excel Table (ListObject), not just a formatted range. This
+    is what lets Power BI's Get Data > Excel Workbook / Power Query pick
+    the data up as a clean, typed, ready-to-use table automatically -
+    no manual range selection, no guessing where the data starts.
+
+    Returns the row number just after the table, so the caller can keep
+    writing further down the same sheet.
+    """
+    header_row = start_row
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=col_idx, value=header)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+
+    for r_offset, row in enumerate(rows, start=1):
+        for col_idx, value in enumerate(row, start=1):
+            ws.cell(row=header_row + r_offset, column=col_idx, value=value)
+
+    last_row = header_row + len(rows)
+    last_col_letter = get_column_letter(len(headers))
+    # A table needs at least one data row - if there's none, add a single
+    # blank one so Excel doesn't reject an empty table range.
+    if not rows:
+        last_row = header_row + 1
+        for col_idx in range(1, len(headers) + 1):
+            ws.cell(row=last_row, column=col_idx, value=None)
+
+    table_ref = f"A{header_row}:{last_col_letter}{last_row}"
+    table = Table(displayName=table_name, ref=table_ref)
+    table.tableStyleInfo = TABLE_STYLE
+    ws.add_table(table)
+
+    if col_widths:
+        for i, w in enumerate(col_widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+    return last_row + 2  # one blank row of spacing after the table
+
+
+def export_executive_summary(flow, sheetnames, output_path):
+    """Writes a separate <workbook>_executive_summary.xlsx, built for two
+    different readers at once:
+
+      - A person skimming it directly: the 'Executive Summary' sheet has
+        headline counts, a Top 10 Most-Connected Sheets table with a bar
+        chart, and a Top 10 Strongest Links table.
+      - Power BI: the 'Sheet Summary' and 'Flow Edges' sheets hold the
+        COMPLETE flat data (every sheet, every link - not just the top
+        10 excerpts above) as native Excel Tables, which Power BI's Get
+        Data > Excel Workbook reads directly as clean structured tables.
+
+    flow is the complete (src_sheet, dst_sheet) -> cell_count dict from
+    build_sheet_flow. sheetnames is every sheet in the workbook (used to
+    also report sheets with zero cross-sheet links, which never appear
+    in flow at all).
+    """
+    all_sheets_with_links = set()
+    incoming_arrows, outgoing_arrows = {}, {}
+    cells_in, cells_out = {}, {}
+    for (src, dst), count in flow.items():
+        all_sheets_with_links.add(src)
+        all_sheets_with_links.add(dst)
+        outgoing_arrows[src] = outgoing_arrows.get(src, 0) + 1
+        incoming_arrows[dst] = incoming_arrows.get(dst, 0) + 1
+        cells_out[src] = cells_out.get(src, 0) + count
+        cells_in[dst] = cells_in.get(dst, 0) + count
+
+    def role_of(sheet):
+        inc, out = incoming_arrows.get(sheet, 0), outgoing_arrows.get(sheet, 0)
+        if inc and out:
+            return "Process"
+        if out and not inc:
+            return "Input"
+        if inc and not out:
+            return "Output"
+        return "Isolated"
+
+    isolated_sheets = [s for s in sheetnames if s not in all_sheets_with_links]
+
+    # Full per-sheet summary (every sheet in the workbook, not just ones
+    # with links) - this is the complete dataset for Power BI.
+    sheet_summary_rows = []
+    for sheet in sheetnames:
+        inc, out = incoming_arrows.get(sheet, 0), outgoing_arrows.get(sheet, 0)
+        sheet_summary_rows.append((
+            sheet, role_of(sheet), inc, out, inc + out,
+            cells_in.get(sheet, 0), cells_out.get(sheet, 0),
+            cells_in.get(sheet, 0) + cells_out.get(sheet, 0),
+        ))
+    sheet_summary_rows.sort(key=lambda r: r[0])
+
+    # Full edge list - this is the other complete dataset for Power BI,
+    # and is also exactly the shape a Power BI Sankey/network visual wants.
+    edge_rows = sorted(
+        [(src, dst, count) for (src, dst), count in flow.items()],
+        key=lambda r: -r[2],
+    )
+
+    input_count = sum(1 for s in all_sheets_with_links if role_of(s) == "Input")
+    process_count = sum(1 for s in all_sheets_with_links if role_of(s) == "Process")
+    output_count = sum(1 for s in all_sheets_with_links if role_of(s) == "Output")
+
+    wb = Workbook()
+
+    # ---------------- Executive Summary sheet ----------------
+    ws_summary = wb.active
+    ws_summary.title = "Executive Summary"
+    ws_summary["A1"] = "Excel Workbook Flow - Executive Summary"
+    ws_summary["A1"].font = Font(bold=True, size=16)
+    ws_summary["A2"] = f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    ws_summary["A2"].font = Font(italic=True, color="666666")
+
+    overview = [
+        ("Total sheets in workbook", len(sheetnames)),
+        ("Sheets with cross-sheet formulas", len(all_sheets_with_links)),
+        ("Isolated sheets (no cross-sheet links)", len(isolated_sheets)),
+        ("Total sheet-to-sheet links (arrows)", len(flow)),
+        ("Total cross-sheet formula cells", sum(flow.values())),
+        ("Input sheets (pure sources)", input_count),
+        ("Process sheets (both feed and are fed)", process_count),
+        ("Output sheets (pure sinks)", output_count),
+    ]
+    row = 4
+    ws_summary.cell(row=row, column=1, value="Overview").font = Font(bold=True, size=13)
+    row += 1
+    for label, value in overview:
+        ws_summary.cell(row=row, column=1, value=label)
+        ws_summary.cell(row=row, column=2, value=value).font = Font(bold=True)
+        row += 1
+    row += 1
+
+    # Top 10 most-connected sheets, by total arrows (in + out)
+    top_connected = sorted(
+        [r for r in sheet_summary_rows if r[4] > 0],
+        key=lambda r: -r[4],
+    )[:10]
+    ws_summary.cell(row=row, column=1, value="Top 10 Most-Connected Sheets").font = Font(bold=True, size=13)
+    row += 1
+    chart_data_start = row
+    row = _write_table(
+        ws_summary, row, "TopConnectedSheets",
+        ["Sheet", "Role", "Incoming Arrows", "Outgoing Arrows", "Total Arrows", "Cells In", "Cells Out", "Total Cells"],
+        top_connected,
+        col_widths=[24, 12, 16, 16, 14, 12, 12, 13],
+    )
+
+    if top_connected:
+        chart = BarChart()
+        chart.title = "Top 10 Most-Connected Sheets (by total arrows)"
+        chart.y_axis.title = "Total Arrows"
+        chart.x_axis.title = "Sheet"
+        data = Reference(ws_summary, min_col=5, min_row=chart_data_start, max_row=chart_data_start + len(top_connected))
+        cats = Reference(ws_summary, min_col=1, min_row=chart_data_start + 1, max_row=chart_data_start + len(top_connected))
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        chart.height, chart.width = 9, 20
+        ws_summary.add_chart(chart, f"J{chart_data_start}")
+
+    # Top 10 strongest individual links, by cell count
+    top_links = edge_rows[:10]
+    ws_summary.cell(row=row, column=1, value="Top 10 Strongest Links").font = Font(bold=True, size=13)
+    row += 1
+    row = _write_table(
+        ws_summary, row, "TopStrongestLinks",
+        ["Source Sheet", "Target Sheet", "Cell Count"],
+        top_links,
+        col_widths=[24, 24, 13],
+    )
+
+    ws_summary.column_dimensions["A"].width = 34
+    ws_summary.column_dimensions["B"].width = 16
+
+    # ---------------- Sheet Summary sheet (full data, Power BI-ready) ----------------
+    ws_sheets = wb.create_sheet("Sheet Summary")
+    _write_table(
+        ws_sheets, 1, "SheetSummary",
+        ["Sheet Name", "Role", "Incoming Arrows", "Outgoing Arrows", "Total Arrows", "Cells In", "Cells Out", "Total Cells"],
+        sheet_summary_rows,
+        col_widths=[28, 12, 16, 16, 14, 12, 12, 13],
+    )
+    ws_sheets.freeze_panes = "A2"
+
+    # ---------------- Flow Edges sheet (full data, Power BI-ready) ----------------
+    ws_edges = wb.create_sheet("Flow Edges")
+    _write_table(
+        ws_edges, 1, "FlowEdges",
+        ["Source Sheet", "Target Sheet", "Cell Count"],
+        edge_rows,
+        col_widths=[28, 28, 13],
+    )
+    ws_edges.freeze_panes = "A2"
+
     wb.save(output_path)
     return output_path
 
@@ -909,6 +1118,16 @@ def main():
         print(f"Wrote sheet trace data to {trace_output_path}")
     except Exception as e:
         print(f"[!] Could not write trace data Excel file: {e}")
+
+    # Write the executive summary / Power BI-ready workbook - a narrative
+    # overview sheet plus two flat Excel Tables (Sheet Summary, Flow
+    # Edges) that Power BI's Get Data > Excel Workbook reads directly.
+    summary_output_path = base + "_executive_summary.xlsx"
+    try:
+        export_executive_summary(flow, sheetnames, summary_output_path)
+        print(f"Wrote executive summary (Power BI-ready) to {summary_output_path}")
+    except Exception as e:
+        print(f"[!] Could not write executive summary Excel file: {e}")
 
     html = build_html(flow)
     if html is None:
