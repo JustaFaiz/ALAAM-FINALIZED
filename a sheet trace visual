@@ -14,13 +14,16 @@ Requires:
 
 Usage:
     python sheet_tree_server.py workbook.xlsx
+    python sheet_tree_server.py workbook.xlsx 500   (only draw arrows backed
+                                                      by 500+ formula cells)
 
-All cross-sheet formula links are shown, including single-cell links -
-there is no minimum-cell threshold. Once the tree is open in your
-browser, use the "Min Incoming" / "Min Outgoing" sliders to filter
-which sheets are displayed, based on each sheet's total incoming/
-outgoing formula reference count (a sheet stays visible if it meets
-EITHER threshold).
+An arrow (sheet-to-sheet link) is only drawn if it's backed by at least
+this many formula cells - 200 by default, overridable via the optional
+second argument above. Once the tree is open in your browser, use the
+"Min Incoming Arrows" / "Min Outgoing Arrows" number fields to further
+filter which sheets are displayed, based on how many such arrows point
+into/out of each sheet (a sheet stays visible if it meets EITHER
+threshold).
 
 This opens the tree in your browser automatically and starts a local
 server. Leave the terminal window open while you use it - closing it
@@ -52,6 +55,11 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 
 PORT = 0  # 0 = let the OS pick a free port - avoids collisions with a still-running
           # earlier session, which was silently serving stale data on a fixed port
+
+# An arrow (sheet-to-sheet link) is only drawn - and only counted toward a
+# sheet's incoming/outgoing arrow count - if it's backed by at least this
+# many formula cells. Overridable via an optional second CLI argument.
+DEFAULT_MIN_CELLS_PER_ARROW = 200
 
 CELL_REF_RE = re.compile(
     r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
@@ -156,18 +164,23 @@ def load_formulas(path):
     return formulas, sheetnames, sheet_bounds
 
 
-def build_sheet_flow(formulas, sheet_bounds):
+def build_sheet_flow(formulas, sheet_bounds, min_cells_per_arrow=DEFAULT_MIN_CELLS_PER_ARROW):
     """Returns (flow, precedent_cells, dependent_cells):
-    - flow: (src_sheet, dst_sheet) -> cell count, for the tree/edges.
-      EVERY cross-sheet link is included here, down to a single cell -
-      there is no minimum-cell cutoff. Filtering which sheets are
-      DISPLAYED (by incoming/outgoing reference count) happens later,
-      client-side in the browser, not here.
+    - flow: (src_sheet, dst_sheet) -> cell count, for EVERY cross-sheet
+      link found, down to a single cell. This is the complete record
+      (also used for the trace-data export) and is NOT filtered by
+      min_cells_per_arrow.
     - precedent_cells: sheet -> cells on that sheet whose formulas pull
       from another sheet (used to draw Trace Precedents arrows)
     - dependent_cells: sheet -> cells on that sheet that get pulled INTO
       formulas on other sheets (used to draw Trace Dependents arrows).
       For a range reference, only its first and last cell are included.
+
+      precedent_cells/dependent_cells ARE restricted to links that meet
+      min_cells_per_arrow, so the arrows drawn in Excel match the arrows
+      drawn in the browser tree - a link too weak to be shown as an
+      arrow in the diagram doesn't get its own Trace Precedents/
+      Dependents arrows in Excel either.
     """
     flow = {}
     raw_refs = []  # (dst_sheet, dst_cell, src_sheet, src_cell)
@@ -184,6 +197,8 @@ def build_sheet_flow(formulas, sheet_bounds):
     precedent_cells = {}
     dependent_cells = {}
     for dst_sheet, dst_cell, src_sheet, src_cell in raw_refs:
+        if flow.get((src_sheet, dst_sheet), 0) < min_cells_per_arrow:
+            continue
         precedent_cells.setdefault(dst_sheet, set()).add(dst_cell)
         dependent_cells.setdefault(src_sheet, set()).add(src_cell)
 
@@ -462,9 +477,12 @@ HTML_TEMPLATE = """<!doctype html>
   }
   #thresholdPanel { margin: 8px 0; }
   #thresholdPanel .row { margin: 4px 0; display:flex; align-items:center; }
-  #thresholdPanel label { width: 140px; flex-shrink:0; }
-  #thresholdPanel input[type="range"] { width: 140px; margin: 0 8px; }
-  #thresholdPanel .val { width: 32px; text-align:right; font-variant-numeric: tabular-nums; }
+  #thresholdPanel label { width: 150px; flex-shrink:0; }
+  #thresholdPanel input[type="number"] {
+    width: 60px; padding: 2px 6px; border-radius: 4px; border: 1px solid #555;
+    background: #222; color: #fff; font-size: 13px; margin-right: 6px;
+  }
+  #thresholdPanel .hint { opacity: 0.7; font-size: 12px; }
   #resetThresholdsBtn {
     cursor:pointer; text-decoration:underline; opacity:0.85; margin-top:2px; display:inline-block;
   }
@@ -490,16 +508,16 @@ HTML_TEMPLATE = """<!doctype html>
   <label><input type="checkbox" id="showDependents" checked> Dependent arrows</label>
   <div id="thresholdPanel">
     <div class="row">
-      <label for="minIncoming">Min Incoming &ge;</label>
-      <input type="range" id="minIncoming" min="0" max="__MAX_IN__" value="0" step="1">
-      <span class="val" id="minIncomingVal">0</span>
+      <label for="minIncoming">Min Incoming Arrows &ge;</label>
+      <input type="number" id="minIncoming" min="0" step="1" value="0">
+      <span class="hint">(max __MAX_IN__)</span>
     </div>
     <div class="row">
-      <label for="minOutgoing">Min Outgoing &ge;</label>
-      <input type="range" id="minOutgoing" min="0" max="__MAX_OUT__" value="0" step="1">
-      <span class="val" id="minOutgoingVal">0</span>
+      <label for="minOutgoing">Min Outgoing Arrows &ge;</label>
+      <input type="number" id="minOutgoing" min="0" step="1" value="0">
+      <span class="hint">(max __MAX_OUT__)</span>
     </div>
-    <span style="opacity:0.8;">A sheet stays visible if it meets EITHER threshold.</span><br>
+    <span style="opacity:0.8;">Arrows below __MIN_CELLS_PER_ARROW__ cells aren't drawn at all. A sheet stays visible if it meets EITHER arrow-count threshold.</span><br>
     <span id="resetThresholdsBtn">Reset thresholds</span>
   </div>
   <span id="status" style="opacity:0.8;"></span>
@@ -645,22 +663,23 @@ HTML_TEMPLATE = """<!doctype html>
     this.innerText = listVisible ? '[show list]' : '[hide list]';
   });
 
-  // --- Incoming / Outgoing reference threshold filter ---
-  // A sheet is shown if EITHER its total incoming reference count meets
-  // minIncoming, OR its total outgoing reference count meets minOutgoing.
-  // Applied via the same applyChanges/undo mechanism as everything else,
-  // so a slider move is one undo step and the side-panel checkboxes stay
-  // in sync automatically.
-  var minIncomingSlider = document.getElementById('minIncoming');
-  var minOutgoingSlider = document.getElementById('minOutgoing');
-  var minIncomingVal = document.getElementById('minIncomingVal');
-  var minOutgoingVal = document.getElementById('minOutgoingVal');
+  // --- Incoming / Outgoing ARROW COUNT threshold filter ---
+  // node.incoming / node.outgoing are ARROW counts (how many distinct
+  // sheet-to-sheet links point into/out of this sheet), not summed cell
+  // counts - only arrows that met the __MIN_CELLS_PER_ARROW__-cell cutoff
+  // exist at all, since weaker links were never sent to the browser.
+  // A sheet is shown if EITHER its incoming arrow count meets minIncoming,
+  // OR its outgoing arrow count meets minOutgoing. Applied via the same
+  // applyChanges/undo mechanism as everything else, so entering a number
+  // is one undo step and the side-panel checkboxes stay in sync.
+  var minIncomingInput = document.getElementById('minIncoming');
+  var minOutgoingInput = document.getElementById('minOutgoing');
 
   function applyThresholdFilter() {
-    var minIn = parseInt(minIncomingSlider.value, 10) || 0;
-    var minOut = parseInt(minOutgoingSlider.value, 10) || 0;
-    minIncomingVal.innerText = minIn;
-    minOutgoingVal.innerText = minOut;
+    var minIn = parseInt(minIncomingInput.value, 10);
+    if (isNaN(minIn) || minIn < 0) minIn = 0;
+    var minOut = parseInt(minOutgoingInput.value, 10);
+    if (isNaN(minOut) || minOut < 0) minOut = 0;
 
     var changes = allSheetIds.map(function(id) {
       var node = nodes.get(id);
@@ -670,11 +689,11 @@ HTML_TEMPLATE = """<!doctype html>
     applyChanges(changes);
   }
 
-  minIncomingSlider.addEventListener('input', applyThresholdFilter);
-  minOutgoingSlider.addEventListener('input', applyThresholdFilter);
+  minIncomingInput.addEventListener('input', applyThresholdFilter);
+  minOutgoingInput.addEventListener('input', applyThresholdFilter);
   document.getElementById('resetThresholdsBtn').addEventListener('click', function() {
-    minIncomingSlider.value = 0;
-    minOutgoingSlider.value = 0;
+    minIncomingInput.value = 0;
+    minOutgoingInput.value = 0;
     applyThresholdFilter();
   });
 
@@ -747,36 +766,39 @@ HTML_TEMPLATE = """<!doctype html>
 """
 
 
-def build_html(flow):
-    """Builds the vis-network tree HTML from the (unfiltered) flow dict -
-    every cross-sheet link is drawn, down to a single cell.
+def build_html(flow, min_cells_per_arrow=DEFAULT_MIN_CELLS_PER_ARROW):
+    """Builds the vis-network tree HTML. An arrow (edge) is only drawn if
+    its cell count meets min_cells_per_arrow (default 200) - weaker links
+    aren't sent to the browser at all, so they can't be filtered back in
+    without restarting with a lower threshold.
 
-    Each node also carries its total incoming/outgoing formula reference
-    count (summed across ALL links touching that sheet, not just the
-    ones drawn as thick edges) - shown as a second label line, in the
-    hover tooltip, and used by the browser's Min Incoming/Min Outgoing
-    sliders to decide which sheets stay visible."""
-    if not flow:
+    Each node carries its ARROW count - how many distinct incoming/
+    outgoing arrows touch it, i.e. in-degree/out-degree among the arrows
+    that survived the threshold above - NOT a sum of cell counts. This is
+    shown as a second label line, in the hover tooltip, and is what the
+    browser's Min Incoming/Min Outgoing Arrows fields filter on."""
+    displayed = {k: v for k, v in flow.items() if v >= min_cells_per_arrow}
+    if not displayed:
         return None
 
     all_sheets = set()
     has_incoming = set()
     has_outgoing = set()
-    incoming_totals = {}
-    outgoing_totals = {}
-    for (src, dst), count in flow.items():
+    incoming_arrows = {}
+    outgoing_arrows = {}
+    for (src, dst), count in displayed.items():
         all_sheets.add(src)
         all_sheets.add(dst)
         has_outgoing.add(src)
         has_incoming.add(dst)
-        outgoing_totals[src] = outgoing_totals.get(src, 0) + count
-        incoming_totals[dst] = incoming_totals.get(dst, 0) + count
+        outgoing_arrows[src] = outgoing_arrows.get(src, 0) + 1
+        incoming_arrows[dst] = incoming_arrows.get(dst, 0) + 1
 
     roots = all_sheets - has_incoming
     leaves = all_sheets - has_outgoing
 
-    max_incoming = max(incoming_totals.values(), default=0)
-    max_outgoing = max(outgoing_totals.values(), default=0)
+    max_incoming = max(incoming_arrows.values(), default=0)
+    max_outgoing = max(outgoing_arrows.values(), default=0)
 
     nodes = []
     for sheet in all_sheets:
@@ -786,24 +808,24 @@ def build_html(flow):
             color = "#f39c12"
         else:
             color = "#2a9d8f"
-        incoming = incoming_totals.get(sheet, 0)
-        outgoing = outgoing_totals.get(sheet, 0)
+        incoming = incoming_arrows.get(sheet, 0)
+        outgoing = outgoing_arrows.get(sheet, 0)
         nodes.append({
             "id": sheet,
-            "label": f"{sheet}\n(in:{incoming} out:{outgoing})",
+            "label": f"{sheet}\n(arrows in:{incoming} out:{outgoing})",
             "color": color,
             "shape": "box", "size": 25,
             "incoming": incoming,
             "outgoing": outgoing,
             "title": (
-                f"{sheet}\nIncoming refs: {incoming}\nOutgoing refs: {outgoing}"
+                f"{sheet}\nIncoming arrows: {incoming}\nOutgoing arrows: {outgoing}"
                 "\nClick to switch to this sheet in Excel"
             ),
         })
 
-    max_count = max(flow.values())
+    max_count = max(displayed.values())
     edges = []
-    for (src, dst), count in flow.items():
+    for (src, dst), count in displayed.items():
         width = 1 + (count / max_count) * 8
         edges.append({
             "from": src, "to": dst, "value": width,
@@ -811,7 +833,8 @@ def build_html(flow):
         })
 
     html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
-    html = html.replace("__MAX_IN__", str(max(max_incoming, 1))).replace("__MAX_OUT__", str(max(max_outgoing, 1)))
+    html = html.replace("__MAX_IN__", str(max_incoming)).replace("__MAX_OUT__", str(max_outgoing))
+    html = html.replace("__MIN_CELLS_PER_ARROW__", str(min_cells_per_arrow))
     return html
 
 
@@ -864,21 +887,30 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python sheet_tree_server.py <workbook.xlsx>")
+        print("Usage: python sheet_tree_server.py <workbook.xlsx> [min_cells_per_arrow]")
         print("No file argument given - exiting rather than opening a hardcoded sample.")
         sys.exit(1)
     path = sys.argv[1]
 
+    min_cells_per_arrow = DEFAULT_MIN_CELLS_PER_ARROW
+    if len(sys.argv) >= 3:
+        try:
+            min_cells_per_arrow = int(sys.argv[2])
+        except ValueError:
+            pass
+
     formulas, sheetnames, sheet_bounds = load_formulas(path)
     print(f"Loaded {len(formulas)} formulas across {len(sheetnames)} sheet(s).")
 
-    flow, precedent_cells, dependent_cells = build_sheet_flow(formulas, sheet_bounds)
-    print(f"Found {len(flow)} distinct sheet-to-sheet link(s) - all links shown, "
-          f"including single-cell links. Use the Min Incoming/Min Outgoing sliders "
-          f"in the browser to filter which sheets are displayed.")
+    flow, precedent_cells, dependent_cells = build_sheet_flow(formulas, sheet_bounds, min_cells_per_arrow=min_cells_per_arrow)
+    displayed_count = sum(1 for v in flow.values() if v >= min_cells_per_arrow)
+    print(f"Found {len(flow)} distinct sheet-to-sheet link(s) total; {displayed_count} "
+          f"meet the {min_cells_per_arrow}-cell threshold and will be drawn as arrows. "
+          f"Use the Min Incoming/Min Outgoing Arrows fields in the browser to filter "
+          f"further, or re-run with a different threshold as a second argument.")
 
     # Write the companion trace-data workbook - a complete record of
-    # every cross-sheet link found.
+    # every cross-sheet link found (not limited by min_cells_per_arrow).
     base, _ext = os.path.splitext(os.path.abspath(path))
     trace_output_path = base + "_trace_data.xlsx"
     try:
@@ -887,9 +919,10 @@ def main():
     except Exception as e:
         print(f"[!] Could not write trace data Excel file: {e}")
 
-    html = build_html(flow)
+    html = build_html(flow, min_cells_per_arrow=min_cells_per_arrow)
     if html is None:
-        print("No cross-sheet formula links found - nothing to draw.")
+        print(f"No links meet the {min_cells_per_arrow}-cell threshold - nothing to draw. "
+              f"Try a lower threshold, e.g.: python sheet_tree_server.py \"{path}\" 50")
         return
 
     Handler.html_content = html
